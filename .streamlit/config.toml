@@ -1,0 +1,11 @@
+# Streamlit configuration (applies locally and on Streamlit Community Cloud).
+[theme]
+base = "light"
+primaryColor = "#0E7C3A"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+# Larger scans (500 tickers) can take a little while on first run.
+runOnSave = false

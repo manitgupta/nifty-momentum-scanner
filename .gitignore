@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment
+venv/
+.venv/
+
+# Cached market data (constituents, prices, market caps)
+data/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# NSE methodology source document (not redistributed with the repo)
+*.pdf
