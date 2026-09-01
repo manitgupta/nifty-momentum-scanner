@@ -27,19 +27,50 @@ MARKETCAP_CACHE_HOURS = 24
 
 # --------------------------------------------------------------------------- #
 # Universe (index constituents) — NSE publishes these as plain CSV downloads.
-# Largecap = Nifty 100, Midcap = Nifty Midcap 150, Small = Nifty Smallcap 250.
-# Their union is (approximately) the Nifty 500, which is the index's base universe.
+#
+# Two flavours are offered:
+#   * Size segments — Largecap = Nifty 100, Midcap = Nifty Midcap 150,
+#     Small = Nifty Smallcap 250. Their union is (approximately) the Nifty 500.
+#   * Whole-index universes — the Nifty 500 and the Nifty Total Market (~750
+#     names, i.e. Nifty 500 + Microcap 250) downloaded directly as a single list.
+#
+# All share NSE's column layout (Company Name, Industry, Symbol, Series, ISIN).
 # --------------------------------------------------------------------------- #
 NSE_BASE = "https://nsearchives.nseindia.com/content/indices"
-SEGMENT_URLS: dict[str, str] = {
+
+# Size buckets whose union approximates the Nifty 500.
+SIZE_SEGMENT_URLS: dict[str, str] = {
     "Largecap": f"{NSE_BASE}/ind_nifty100list.csv",
     "Midcap": f"{NSE_BASE}/ind_niftymidcap150list.csv",
     "Small": f"{NSE_BASE}/ind_niftysmallcap250list.csv",
 }
+
+# Whole-index universes downloaded as one CSV each.
+INDEX_UNIVERSE_URLS: dict[str, str] = {
+    "Nifty500": f"{NSE_BASE}/ind_nifty500list.csv",
+    "NiftyTotalMarket": f"{NSE_BASE}/ind_niftytotalmarket_list.csv",
+}
+
+# Combined lookup; size segments first so that when a stock appears in several
+# selected universes the size-bucket label wins during de-duplication.
+SEGMENT_URLS: dict[str, str] = {**SIZE_SEGMENT_URLS, **INDEX_UNIVERSE_URLS}
 SEGMENTS = list(SEGMENT_URLS.keys())
+SIZE_SEGMENTS = list(SIZE_SEGMENT_URLS.keys())
+INDEX_UNIVERSES = list(INDEX_UNIVERSE_URLS.keys())
 
 # Yahoo Finance ticker suffix for NSE-listed equities.
 YF_SUFFIX = ".NS"
+
+# --------------------------------------------------------------------------- #
+# Benchmark indices — Yahoo Finance index symbols, used to draw a comparison
+# equity curve against the momentum portfolio in backtests. (Nifty Total Market
+# has no working Yahoo symbol, so the Nifty 500 serves as its proxy benchmark.)
+# --------------------------------------------------------------------------- #
+BENCHMARKS: dict[str, str] = {
+    "Nifty 50": "^NSEI",
+    "Nifty 500": "^CRSLDX",
+}
+DEFAULT_BENCHMARK = "Nifty 500"
 
 # Browser-like headers; NSE archives reject requests without a User-Agent.
 HTTP_HEADERS = {
@@ -56,8 +87,16 @@ HTTP_TIMEOUT = 30
 # Momentum methodology parameters (PDF section 20)
 # --------------------------------------------------------------------------- #
 TRADING_DAYS_PER_YEAR = 252  # for annualising daily-return volatility (sigma_p)
-MONTHS_12 = 12               # 12-month momentum lookback
-MONTHS_6 = 6                 # 6-month momentum lookback
+MONTHS_12 = 12               # long-leg momentum lookback (methodology: 12 months)
+MONTHS_6 = 6                 # short-leg momentum lookback (methodology: 6 months)
+
+# Skip-month ("12-1" momentum): exclude the most recent N months from BOTH
+# lookbacks to sidestep short-term reversal. 0 = methodology default (no skip).
+SKIP_MONTHS = 0
+
+# Trailing window (months) over which sigma_p is measured. Methodology uses the
+# trailing year; exposed so it can be tuned independently of the lookbacks.
+VOL_LOOKBACK_MONTHS = 12
 
 # Weighted Average Z Score = W12 * Z12 + W6 * Z6  (methodology uses 50/50).
 WEIGHT_12M = 0.50
@@ -89,7 +128,21 @@ ZSCORE_DDOF = 0
 # Data-fetch tuning
 # --------------------------------------------------------------------------- #
 # Extra calendar buffer beyond 12 months so the 12M-ago trading day is always
-# present even across long holidays; ~15 months of history is fetched.
+# present even across long holidays; ~15 months of history is fetched for a
+# single live scan.
 PRICE_LOOKBACK_DAYS = 400
 MARKETCAP_MAX_WORKERS = 12  # threads for per-ticker fast_info calls
 DOWNLOAD_BATCH_SIZE = 100   # tickers per yfinance.download batch
+
+# --------------------------------------------------------------------------- #
+# Backtesting
+# --------------------------------------------------------------------------- #
+# Default depth of price history to fetch for backtests. The request is "more
+# than 7-8 years"; 9 years gives a comfortable margin and still leaves a full
+# 12-month lookback available before the first rebalance.
+BACKTEST_DEFAULT_YEARS = 9
+BACKTEST_MIN_YEARS = 1
+BACKTEST_MAX_YEARS = 15
+# Long-history downloads are cached far longer than the 6h live-scan cache: the
+# deep past does not change, so re-fetching multi-year frames is wasteful.
+HISTORY_CACHE_HOURS = 24 * 7

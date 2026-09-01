@@ -90,6 +90,84 @@ def test_iterative_cap():
 
 
 # --------------------------------------------------------------------------- #
+def test_asof_closes():
+    """Per-column as-of close: forward-fills gaps, honours the as-of cutoff."""
+    idx = pd.to_datetime(["2026-01-01", "2026-01-05", "2026-01-10"])
+    frame = pd.DataFrame(
+        {"A.NS": [100.0, 110.0, 121.0], "B.NS": [50.0, np.nan, 55.0]}, index=idx
+    )
+    s = scanner._asof_closes(frame, dt.date(2026, 1, 7))
+    check("asof_closes A -> last prior", s["A.NS"] == 110.0)
+    check("asof_closes B -> ffill over NaN", s["B.NS"] == 50.0)
+    empty = scanner._asof_closes(pd.DataFrame(), dt.date(2026, 1, 7))
+    check("asof_closes empty -> empty", empty.empty)
+
+
+# --------------------------------------------------------------------------- #
+def test_skip_month_momentum():
+    """skip_months shifts the return end-point back; lookback months are configurable."""
+    asof = dt.date(2026, 6, 30)
+    idx = pd.bdate_range(end=pd.Timestamp(asof), periods=400)
+    # Ramp up then fall in the final ~month, so skipping that month raises the return.
+    vals = np.linspace(100.0, 200.0, len(idx))
+    vals[-21:] = np.linspace(200.0, 150.0, 21)  # recent drawdown
+    close = pd.DataFrame({"X.NS": vals}, index=idx)
+
+    p_no_skip = scanner.compute_momentum(
+        close, scanner.ScanParams(asof=asof, skip_months=0, lookback_long_months=12,
+                                  lookback_short_months=6)
+    )
+    p_skip = scanner.compute_momentum(
+        close, scanner.ScanParams(asof=asof, skip_months=1, lookback_long_months=12,
+                                  lookback_short_months=6)
+    )
+    check("skip-month raises 12M return after recent drawdown",
+          p_skip.loc["X.NS", "ret_12m"] > p_no_skip.loc["X.NS", "ret_12m"],
+          f"skip={p_skip.loc['X.NS','ret_12m']:.4f} vs no-skip={p_no_skip.loc['X.NS','ret_12m']:.4f}")
+
+    # Shorter lookback -> smaller ramp captured -> smaller 12M-leg return here.
+    p_short_lb = scanner.compute_momentum(
+        close, scanner.ScanParams(asof=asof, skip_months=0, lookback_long_months=6,
+                                  lookback_short_months=3)
+    )
+    check("configurable long lookback changes the return leg",
+          not math.isclose(p_short_lb.loc["X.NS", "ret_12m"],
+                           p_no_skip.loc["X.NS", "ret_12m"], rel_tol=1e-6))
+
+
+# --------------------------------------------------------------------------- #
+def test_close_price_column():
+    """run_scan attaches raw close_price; adjusted close drives returns."""
+    asof = dt.date(2026, 8, 14)
+    idx = pd.bdate_range(end=pd.Timestamp(asof), periods=300)
+    adj = pd.DataFrame({"A.NS": np.linspace(100, 200, len(idx))}, index=idx)
+    raw = adj * 1.10  # raw close deliberately differs from adjusted
+    volume = pd.DataFrame(1_000_000, index=idx, columns=adj.columns)
+    market = pd.DataFrame(
+        {"market_cap": [5e11], "shares": [1e9], "last_price": [1.0]}, index=adj.columns
+    )
+    pdata = PriceData(close=adj, raw_close=raw, volume=volume, market=market, failed=[])
+    universe = pd.DataFrame(
+        {"Symbol": ["A"], "Company": ["A Co"], "Industry": ["X"],
+         "Segment": ["Largecap"], "YFTicker": ["A.NS"]}
+    )
+    params = scanner.ScanParams(
+        asof=asof, top_n=1, apply_listing_filter=False,
+        apply_liquidity_filter=False, apply_turnover_ratio_filter=False,
+    )
+    res = scanner.run_scan(universe, pdata, params)
+    check("close_price column present", "close_price" in res.results.columns)
+    check("close_price uses RAW close (last value)",
+          math.isclose(res.results.loc["A.NS", "close_price"], float(raw["A.NS"].iloc[-1]), rel_tol=1e-9))
+
+    # Without a raw_close frame, it falls back to the adjusted close.
+    pdata2 = PriceData(close=adj, volume=volume, market=market, failed=[])
+    res2 = scanner.run_scan(universe, pdata2, params)
+    check("close_price falls back to adjusted when raw absent",
+          math.isclose(res2.results.loc["A.NS", "close_price"], float(adj["A.NS"].iloc[-1]), rel_tol=1e-9))
+
+
+# --------------------------------------------------------------------------- #
 def test_integration_ranking():
     """Synthetic prices: strong drift should out-rank flat should out-rank weak."""
     asof = dt.date(2026, 8, 14)
@@ -140,7 +218,10 @@ def test_integration_ranking():
 
 if __name__ == "__main__":
     test_asof_price()
+    test_asof_closes()
     test_score_piecewise()
+    test_skip_month_momentum()
+    test_close_price_column()
     test_iterative_cap()
     test_integration_ranking()
     print("-" * 50)

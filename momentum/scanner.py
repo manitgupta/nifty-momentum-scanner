@@ -37,6 +37,12 @@ class ScanParams:
     trading_days: int = config.TRADING_DAYS_PER_YEAR
     zscore_ddof: int = config.ZSCORE_DDOF
     vol_ddof: int = config.VOL_DDOF
+    # momentum window (months). Defaults reproduce the published 6M/12M legs;
+    # column names keep the 6m/12m labels even when these are retuned.
+    lookback_long_months: int = config.MONTHS_12
+    lookback_short_months: int = config.MONTHS_6
+    skip_months: int = config.SKIP_MONTHS          # "12-1" style: skip recent N months
+    vol_lookback_months: int = config.VOL_LOOKBACK_MONTHS
     # eligibility
     min_listing_days: int = config.MIN_LISTING_CALENDAR_DAYS
     min_observations: int = config.MIN_OBSERVATIONS
@@ -70,6 +76,14 @@ def _asof_price(series: pd.Series, when: dt.date) -> float:
     return float(s.iloc[-1]) if len(s) else np.nan
 
 
+def _asof_closes(frame: pd.DataFrame, when: dt.date) -> pd.Series:
+    """Per-column last valid close on or before ``when``; empty frame -> empty Series."""
+    if frame is None or frame.empty:
+        return pd.Series(dtype="float64")
+    s = frame[frame.index <= pd.Timestamp(when)]
+    return s.ffill().iloc[-1] if len(s) else pd.Series(np.nan, index=frame.columns)
+
+
 # --------------------------------------------------------------------------- #
 # 1. Momentum
 # --------------------------------------------------------------------------- #
@@ -78,11 +92,17 @@ def compute_momentum(close: pd.DataFrame, params: ScanParams) -> pd.DataFrame:
 
     Returns a DataFrame indexed by ticker with:
         ret_6m, ret_12m, sigma, mr_6, mr_12, n_obs, first_date, last_date
+
+    The two return legs span ``[asof - lookback_{long,short}_months, asof - skip_months]``.
+    With ``skip_months = 0`` the end point is ``asof`` (methodology default);
+    a positive skip reproduces "12-1"-style momentum. Column names retain the
+    6m/12m labels regardless of the configured window lengths.
     """
     asof = params.asof
-    date_6m = asof - relativedelta(months=config.MONTHS_6)
-    date_12m = asof - relativedelta(months=config.MONTHS_12)
-    vol_start = asof - relativedelta(years=1)
+    end = asof - relativedelta(months=params.skip_months)   # skip most recent N months
+    date_6m = asof - relativedelta(months=params.lookback_short_months)
+    date_12m = asof - relativedelta(months=params.lookback_long_months)
+    vol_start = asof - relativedelta(months=params.vol_lookback_months)
 
     rows = []
     for ticker in close.columns:
@@ -90,14 +110,14 @@ def compute_momentum(close: pd.DataFrame, params: ScanParams) -> pd.DataFrame:
         if series.empty:
             continue
 
-        p0 = _asof_price(series, asof)
+        p0 = _asof_price(series, end)
         p6 = _asof_price(series, date_6m)
         p12 = _asof_price(series, date_12m)
 
         ret_6m = p0 / p6 - 1.0 if (p6 and not np.isnan(p6)) else np.nan
         ret_12m = p0 / p12 - 1.0 if (p12 and not np.isnan(p12)) else np.nan
 
-        # Annualised std-dev of lognormal daily returns over the trailing 1 year.
+        # Annualised std-dev of lognormal daily returns over the trailing window.
         window = series[(series.index > pd.Timestamp(vol_start)) & (series.index <= pd.Timestamp(asof))]
         log_ret = np.log(window / window.shift(1)).dropna()
         if len(log_ret) >= 2:
@@ -229,8 +249,11 @@ def normalize_and_score(df: pd.DataFrame, params: ScanParams) -> pd.DataFrame:
     mu12, sd12 = elig["mr_12"].mean(), elig["mr_12"].std(ddof=params.zscore_ddof)
     mu6, sd6 = elig["mr_6"].mean(), elig["mr_6"].std(ddof=params.zscore_ddof)
 
-    z12 = (df["mr_12"] - mu12) / sd12 if sd12 else np.nan
-    z6 = (df["mr_6"] - mu6) / sd6 if sd6 else np.nan
+    # Guard the degenerate case (e.g. a single eligible stock -> zero spread):
+    # fall back to an all-NaN Series so downstream `.where` stays vectorised.
+    nan_series = pd.Series(np.nan, index=df.index)
+    z12 = (df["mr_12"] - mu12) / sd12 if sd12 else nan_series
+    z6 = (df["mr_6"] - mu6) / sd6 if sd6 else nan_series
     df["z_12"] = z12.where(df["eligible"])
     df["z_6"] = z6.where(df["eligible"])
 
@@ -327,8 +350,15 @@ def run_scan(universe: pd.DataFrame, price_data, params: ScanParams) -> ScanResu
     momentum = compute_momentum(close, params)
     liquidity = compute_liquidity(close, volume, market, params)
 
+    # Raw closing price on the as-of date (for display). Fall back to adjusted
+    # close when a caller did not supply a raw-close frame.
+    raw_close = getattr(price_data, "raw_close", None)
+    price_source = raw_close if (raw_close is not None and not raw_close.empty) else close
+    close_price = _asof_closes(price_source, params.asof).rename("close_price")
+
     df = momentum.join(liquidity, how="left")
     df = df.join(market, how="left")
+    df = df.join(close_price, how="left")
 
     df, exclusions = apply_eligibility(df, params)
     df = normalize_and_score(df, params)
