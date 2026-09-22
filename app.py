@@ -366,13 +366,15 @@ BACKTEST_DISCLAIMER = (
 )
 
 
-def _run_backtest(years, freq_months, weighting, cost_bps, bench_name, rf):
+def _run_backtest(start, end, freq_months, weighting, top_n_bt, cost_bps, bench_name, rf):
     if not selected_segments:
         st.error("Select at least one universe segment in the sidebar.")
         return None
 
-    end = min(asof, dt.date.today())
-    start = end - relativedelta(years=int(years))
+    end = min(end, dt.date.today())
+    if start >= end:
+        st.error("Backtest **start** date must be before the **end** date.")
+        return None
     hist_start = _history_start(start)
 
     with st.status("Fetching history & running backtest…", expanded=True) as status:
@@ -409,7 +411,11 @@ def _run_backtest(years, freq_months, weighting, cost_bps, bench_name, rf):
             rbar.progress(min(done / total, 1.0), text=f"Rebalance {done}/{total}")
 
         bp = backtest.BacktestParams(
-            scan_params=replace(_base_scan_params(end), apply_turnover_ratio_filter=False),
+            scan_params=replace(
+                _base_scan_params(end),
+                apply_turnover_ratio_filter=False,
+                top_n=int(top_n_bt),
+            ),
             start=start, end=end, rebalance_months=int(freq_months),
             weighting=weighting, cost_bps=float(cost_bps), rf_annual=rf / 100.0,
         )
@@ -418,7 +424,8 @@ def _run_backtest(years, freq_months, weighting, cost_bps, bench_name, rf):
 
     return {"res": res, "bench_name": bench_name, "segments": selected_segments,
             "start": start, "end": end, "weighting": weighting,
-            "freq_months": int(freq_months), "cost_bps": float(cost_bps)}
+            "freq_months": int(freq_months), "cost_bps": float(cost_bps),
+            "top_n": int(top_n_bt)}
 
 
 def _pct(x, d=1):
@@ -517,12 +524,14 @@ def _render_backtest_results(res: backtest.BacktestResult, bench_name: str) -> N
     cB.markdown("**Strategy vs benchmark**")
     cB.dataframe(rel, hide_index=True, width="stretch")
 
-    # Drawdown episode dates.
+    # Drawdown episode dates + run summary (span, rebalances, portfolio size).
+    top_n_used = res.params.scan_params.top_n if res.params else None
+    holds_note = f", up to {top_n_used} holdings" if top_n_used else ""
     st.caption(
         f"Max drawdown episode — peak {_dte(m.get('mdd_peak_date'))} → "
         f"trough {_dte(m.get('mdd_trough_date'))} → recovery {_dte(m.get('mdd_recovery_date'))}. "
         f"Backtest span {res.equity_curve.index[0].date()} → {res.equity_curve.index[-1].date()} "
-        f"({m.get('n_rebalances', 0)} rebalances)."
+        f"({m.get('n_rebalances', 0)} rebalances{holds_note})."
     )
 
     # -- Per-period returns ------------------------------------------------- #
@@ -571,6 +580,82 @@ def _render_backtest_results(res: backtest.BacktestResult, bench_name: str) -> N
                 )
                 st.bar_chart(h.set_index("Symbol")["weight"] * 100.0, height=280)
 
+    # -- Index membership changes (entries / exits) ------------------------- #
+    with st.expander("Index membership changes — scrips entering / leaving"):
+        mc = res.membership_changes
+        if mc is None or mc.empty:
+            st.caption("No membership changes recorded (all-cash backtest).")
+        else:
+            st.caption(
+                "Each rebalance compared with the previous one. The first row is the initial "
+                "deployment (every name enters). **Entered** / **Exited** list the scrips that "
+                "joined or dropped out of the momentum portfolio as the ranking changed."
+            )
+            mtbl = pd.DataFrame({
+                "Rebalance": pd.to_datetime(mc["rebalance_date"]).dt.date,
+                "Held": mc["n_held"],
+                "In": mc["n_entered"],
+                "Out": mc["n_exited"],
+                "Entered": mc["entered"],
+                "Exited": mc["exited"],
+            })
+            st.dataframe(mtbl, hide_index=True, width="stretch")
+            st.download_button(
+                "⬇️ Membership changes (CSV)", mc.to_csv(index=False).encode(),
+                file_name="backtest_membership_changes.csv", mime="text/csv",
+                key="dl_membership",
+            )
+
+    # -- Transaction ledger (detailed report) ------------------------------- #
+    with st.expander("Transaction ledger — detailed trade report"):
+        tx = res.transactions
+        if tx is None or tx.empty:
+            st.caption("No transactions recorded (all-cash backtest).")
+        else:
+            cap = res.params.initial_capital if res.params else config.BACKTEST_INITIAL_CAPITAL
+            st.caption(
+                f"Every trade the strategy makes at each rebalance, denominated on a starting "
+                f"capital of ₹{cap:,.0f} that compounds with the portfolio (so rupee figures track "
+                f"the Growth of ₹{cap:,.0f} chart). Prices are as-of **adjusted** closes; weights "
+                "are score/equal (never market-cap-capped). Modelled cost = bps × traded value."
+            )
+            tx_dates = sorted(tx["rebalance_date"].unique())
+            j = st.selectbox(
+                "Rebalance date", options=list(range(len(tx_dates))),
+                format_func=lambda k: pd.Timestamp(tx_dates[k]).date().isoformat(),
+                index=len(tx_dates) - 1, key="bt_tx_date",
+            )
+            day = tx[tx["rebalance_date"] == tx_dates[j]]
+            s = st.columns(3)
+            s[0].metric("Trades (excl. holds)", int((day["side"] != "HOLD").sum()))
+            s[1].metric("Traded value", f"₹{day['traded_value'].sum():,.2f}")
+            s[2].metric("Est. cost", f"₹{day['cost'].sum():,.2f}")
+            view = pd.DataFrame({
+                "Symbol": day["Symbol"].values,
+                "Company": day["Company"].values,
+                "Side": day["side"].values,
+                "Price (₹)": day["price"].round(2).values,
+                "Prior wt %": (day["prior_weight"] * 100).round(2).values,
+                "Target wt %": (day["target_weight"] * 100).round(2).values,
+                "Δ wt %": (day["delta_weight"] * 100).round(2).values,
+                "Prior ₹": day["prior_value"].round(2).values,
+                "Target ₹": day["target_value"].round(2).values,
+                "Traded ₹": day["traded_value"].round(2).values,
+                "Cost ₹": day["cost"].round(4).values,
+            })
+            st.dataframe(
+                view, hide_index=True, width="stretch",
+                column_config={
+                    "Prior wt %": PCT_FMT, "Target wt %": PCT_FMT, "Δ wt %": PCT_FMT,
+                    "Price (₹)": st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
+            st.download_button(
+                "⬇️ Full transaction ledger (CSV)", tx.to_csv(index=False).encode(),
+                file_name="backtest_transactions.csv", mime="text/csv",
+                key="dl_transactions",
+            )
+
     # -- Downloads ---------------------------------------------------------- #
     st.subheader("Downloads")
     d1, d2, d3 = st.columns(3)
@@ -607,15 +692,30 @@ def render_backtest_tab() -> None:
 
     c = st.columns(4)
     bt_freq = c[0].selectbox("Rebalance", list(FREQ_MONTHS), index=2, key="bt_freq")
-    bt_years = c[1].slider(
-        "History (years)", config.BACKTEST_MIN_YEARS, config.BACKTEST_MAX_YEARS,
-        config.BACKTEST_DEFAULT_YEARS, key="bt_years",
-    )
-    bt_weighting = c[2].radio(
+    bt_weighting = c[1].radio(
         "Weighting", ["score", "equal"], index=0, horizontal=True, key="bt_weighting",
         help="Market-cap capping is disabled in backtests (look-ahead).",
     )
+    bt_topn = c[2].number_input(
+        "Holdings (Top N)", 1, 200, int(top_n), step=1, key="bt_topn",
+        help="Backtest only the top-N momentum names each rebalance — e.g. set 10 for a "
+        "concentrated top-10 portfolio. Defaults to the sidebar's Top N; every other "
+        "parameter is unchanged.",
+    )
     bt_cost = c[3].number_input("Cost (bps/side)", 0.0, 100.0, 0.0, step=5.0, key="bt_cost")
+
+    # Explicit performance window — "between two specific dates".
+    default_end = min(asof, dt.date.today())
+    default_start = default_end - relativedelta(years=config.BACKTEST_DEFAULT_YEARS)
+    d = st.columns(2)
+    bt_start = d[0].date_input(
+        "Backtest start", value=default_start, max_value=default_end, key="bt_start",
+        help="Performance is measured between these two dates. The first rebalance may be "
+        "pushed later automatically if there isn't enough prior price history for a scan.",
+    )
+    bt_end = d[1].date_input(
+        "Backtest end", value=default_end, max_value=dt.date.today(), key="bt_end",
+    )
 
     c2 = st.columns(2)
     bt_bench = c2[0].selectbox(
@@ -626,7 +726,7 @@ def render_backtest_tab() -> None:
 
     if st.button("🚀 Run backtest", type="primary", width="stretch", key="run_bt"):
         st.session_state["bt"] = _run_backtest(
-            bt_years, FREQ_MONTHS[bt_freq], bt_weighting, bt_cost, bt_bench, bt_rf
+            bt_start, bt_end, FREQ_MONTHS[bt_freq], bt_weighting, bt_topn, bt_cost, bt_bench, bt_rf
         )
 
     bt = st.session_state.get("bt")

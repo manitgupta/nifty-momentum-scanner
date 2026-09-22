@@ -55,6 +55,7 @@ class BacktestParams:
     rf_annual: float = 0.0         # risk-free p.a. for Sharpe/Sortino (rf=0 default)
     trading_days: int = config.TRADING_DAYS_PER_YEAR
     min_history_months: int | None = None  # override; None -> derived from scan_params
+    initial_capital: float = config.BACKTEST_INITIAL_CAPITAL  # ₹ notional for the trade ledger
 
 
 @dataclass
@@ -69,6 +70,8 @@ class BacktestResult:
     metrics: dict[str, float]
     benchmark_metrics: dict[str, float]
     relative_metrics: dict[str, float]
+    membership_changes: pd.DataFrame = field(default_factory=pd.DataFrame)  # per-rebalance entries/exits
+    transactions: pd.DataFrame = field(default_factory=pd.DataFrame)        # per-rebalance trade ledger
     notes: list[str] = field(default_factory=list)
     params: BacktestParams | None = None
     benchmark_name: str = ""
@@ -354,6 +357,125 @@ def compute_relative_metrics(
 
 
 # --------------------------------------------------------------------------- #
+# Membership changes (entries / exits) & transaction ledger
+# --------------------------------------------------------------------------- #
+def _symbols(h: pd.DataFrame | None) -> list[str]:
+    """Ordered symbols of a holdings frame (falls back to the index/ticker)."""
+    if h is None or h.empty:
+        return []
+    if "Symbol" in h.columns:
+        return h["Symbol"].tolist()
+    return [str(t) for t in h.index]
+
+
+def compute_membership_changes(
+    holdings: dict[pd.Timestamp, pd.DataFrame], rebalance_dates: list[pd.Timestamp]
+) -> pd.DataFrame:
+    """Per-rebalance churn: which scrips ENTER and EXIT the momentum portfolio.
+
+    Compares each rebalance's selected names against the previous rebalance's.
+    The first rebalance shows every name as an entry (the initial deployment);
+    a rebalance that holds cash shows the whole prior book as exits. Returns a
+    DataFrame with columns rebalance_date, n_held, n_entered, n_exited, entered,
+    exited (the last two are comma-joined symbol strings, sorted).
+    """
+    rows: list[dict] = []
+    prev: set[str] = set()
+    for d in rebalance_dates:
+        cur_list = _symbols(holdings.get(d))
+        cur = set(cur_list)
+        entered = sorted(cur - prev)
+        exited = sorted(prev - cur)
+        rows.append({
+            "rebalance_date": d,
+            "n_held": len(cur),
+            "n_entered": len(entered),
+            "n_exited": len(exited),
+            "entered": ", ".join(entered),
+            "exited": ", ".join(exited),
+        })
+        prev = cur
+    return pd.DataFrame(
+        rows,
+        columns=["rebalance_date", "n_held", "n_entered", "n_exited", "entered", "exited"],
+    )
+
+
+def _classify_side(w_prev: float, w_new: float, eps: float = 1e-9) -> str:
+    """Trade direction for one name given its prior (drifted) and target weight."""
+    if w_prev <= eps and w_new > eps:
+        return "BUY (new)"
+    if w_new <= eps and w_prev > eps:
+        return "SELL (exit)"
+    if w_new - w_prev > eps:
+        return "BUY"
+    if w_prev - w_new > eps:
+        return "SELL"
+    return "HOLD"
+
+
+def _ledger_rows(
+    t0: pd.Timestamp,
+    w_new: pd.Series,
+    w_prev_drift: pd.Series,
+    close: pd.DataFrame,
+    e0: float,
+    cost_bps: float,
+    initial_capital: float,
+    meta_map: pd.DataFrame | None,
+    meta_now: pd.DataFrame | None,
+) -> list[dict]:
+    """Per-name trades that turn the drifted prior book into the new targets at ``t0``.
+
+    Notional is denominated in ₹ against a starting capital of ``initial_capital``
+    grown by the (unitless) portfolio multiple ``e0`` at this rebalance — so the
+    ledger's rupee figures track the "Growth of ₹<capital>" chart. Both prior and
+    target values use the *pre-cost* portfolio value ``base`` as the common base,
+    so ``Σ traded_value = base·Σ|Δw| = 2·base·turnover`` and the summed per-trade
+    cost equals ``base·cost_drag`` — consistent with the engine's turnover/cost.
+    Prices are as-of adjusted closes (the series the return maths uses).
+    """
+    ix = w_new.index.union(w_prev_drift.index)
+    if len(ix) == 0:
+        return []
+    prices = _asof_prices(close, ix, t0)
+    base = float(e0) * float(initial_capital)
+    rate = cost_bps / 1e4
+    rows: list[dict] = []
+    for tk in ix:
+        wp = float(w_prev_drift.get(tk, 0.0))
+        wn = float(w_new.get(tk, 0.0))
+        dw = wn - wp
+        traded_val = abs(dw) * base
+        sym, company = str(tk), ""
+        if meta_map is not None and tk in meta_map.index:
+            sym = meta_map.at[tk, "Symbol"]
+            company = meta_map.at[tk, "Company"]
+        score = np.nan
+        if meta_now is not None and "score" in meta_now.columns and tk in meta_now.index:
+            score = float(meta_now.at[tk, "score"])
+        rows.append({
+            "rebalance_date": t0,
+            "Symbol": sym,
+            "Company": company,
+            "YFTicker": tk,
+            "side": _classify_side(wp, wn),
+            "price": float(prices.get(tk, np.nan)),
+            "prior_weight": wp,
+            "target_weight": wn,
+            "delta_weight": dw,
+            "prior_value": wp * base,
+            "target_value": wn * base,
+            "traded_value": traded_val,
+            "cost": rate * traded_val,
+            "score": score,
+        })
+    # Traded names first (largest trade on top), then holds — most useful ordering.
+    rows.sort(key=lambda r: (r["side"] == "HOLD", -r["traded_value"]))
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # Orchestrator
 # --------------------------------------------------------------------------- #
 def _base_notes(params: BacktestParams) -> list[str]:
@@ -436,12 +558,21 @@ def run_backtest(
         if progress:
             progress(i + 1, len(rb))
 
+    # Ticker -> Symbol/Company map for the trade ledger (covers exited names too).
+    meta_cols = [c for c in ("Symbol", "Company") if c in universe_df.columns]
+    meta_map = (
+        universe_df.drop_duplicates("YFTicker").set_index("YFTicker")[meta_cols]
+        if "YFTicker" in universe_df.columns and len(meta_cols) == 2
+        else None
+    )
+
     # -- PASS B: chain daily buy-and-hold multiples -------------------------- #
     E = 1.0
     w_prev = pd.Series(dtype="float64")
     eq: dict[pd.Timestamp, float] = {boundary[0]: 1.0}
     prows: list[dict] = []
     holdings: dict[pd.Timestamp, pd.DataFrame] = {}
+    tx_rows: list[dict] = []
 
     for i in range(len(boundary) - 1):
         t0, t1 = boundary[i], boundary[i + 1]
@@ -449,6 +580,11 @@ def run_backtest(
 
         one_way, cost = _turnover_and_cost(w, w_prev, params.cost_bps)
         E0 = E
+        # Ledger uses w_prev (the drifted prior book) BEFORE it is overwritten below.
+        tx_rows.extend(_ledger_rows(
+            t0, w, w_prev, close, E0, params.cost_bps,
+            params.initial_capital, meta_map, meta_by_date.get(t0),
+        ))
         E *= (1.0 - cost)
 
         days = cal[(cal > t0) & (cal <= t1)]
@@ -482,6 +618,9 @@ def run_backtest(
     equity.name = "portfolio"
 
     period_returns = pd.DataFrame(prows).set_index("rb_date")
+    transactions = pd.DataFrame(tx_rows)
+    # Membership churn over the periods actually simulated (the t0 boundaries).
+    membership_changes = compute_membership_changes(holdings, list(boundary[:-1]))
 
     # -- benchmark alignment ------------------------------------------------- #
     bench_curve = _align_benchmark(benchmark_series, equity.index, boundary[0])
@@ -531,6 +670,8 @@ def run_backtest(
         metrics=metrics,
         benchmark_metrics=benchmark_metrics,
         relative_metrics=relative_metrics,
+        membership_changes=membership_changes,
+        transactions=transactions,
         notes=notes,
         params=params,
     )

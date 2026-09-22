@@ -60,6 +60,21 @@ The app has two tabs sharing one sidebar configuration:
   rebalance schedule, a holdings viewer, and CSV exports. Optional per-side
   trading-cost (bps) modelling is included.
 
+  The Backtest tab lets you:
+  - **Pick an exact date window** — choose the **start** and **end** dates to
+    measure performance between any two specific dates (the first rebalance is
+    auto-nudged later only if there isn't enough prior history for a scan).
+  - **Set the portfolio size (Top N)** — backtest only the top-N momentum names
+    each rebalance (e.g. **10** for a concentrated top-10 portfolio); every other
+    parameter is unchanged.
+  - **See index churn** — a per-rebalance **entries / exits** table naming the
+    scrips that joined or dropped out of the momentum portfolio as the ranking
+    changed (with a CSV export).
+  - **Read the transaction ledger** — a detailed per-rebalance trade report: side
+    (buy / sell / new / exit), as-of price, prior vs target weight, and the rupee
+    prior / target / traded value and modelled cost of each trade, denominated on
+    a ₹100 starting capital that compounds with the portfolio (with a CSV export).
+
 ### Backtest honesty (important)
 
 The backtest is deliberately **look-ahead-free**: selection at each rebalance
@@ -129,6 +144,17 @@ rate-limit large (500-stock) scans — rerun, or start with a single segment.
 ./venv/bin/python tests/test_app.py        # Streamlit UI (headless AppTest, offline)
 ```
 
+The tests are dependency-free (a tiny hand-rolled `check()` harness, no pytest) so
+they run against the app's own `requirements.txt`. To measure coverage, install the
+optional dev tool and run under it:
+
+```bash
+./venv/bin/python -m pip install -r requirements-dev.txt
+./venv/bin/python -m coverage run --branch --source=momentum.backtest,app tests/test_backtest.py
+./venv/bin/python -m coverage run --append --branch --source=momentum.backtest,app tests/test_app.py
+./venv/bin/python -m coverage report -m
+```
+
 - **`test_scanner.py`** — as-of price lookup, the Z-score → Normalized Momentum
   Score piecewise formula (both branches), the iterative weight-capping algorithm,
   skip-month / configurable-lookback momentum, the raw closing-price column, and an
@@ -136,13 +162,18 @@ rate-limit large (500-stock) scans — rerun, or start with a single segment.
 - **`test_backtest.py`** — rebalance scheduling (incl. holiday snapping), the
   buy-and-hold return identity, a **no-look-ahead invariance** check, compounding
   continuity, transaction-cost monotonicity, closed-form analytics
-  (CAGR/vol/drawdown), benchmark alignment, and edge cases (missing benchmark,
-  pre-feasibility window, cash periods).
+  (CAGR/vol/drawdown), benchmark alignment, edge cases (missing benchmark,
+  pre-feasibility window, cash periods), and — for the detailed backtest report —
+  **membership churn** (entries/exits), trade-side classification, and the
+  **transaction ledger** including a reconciliation that its rupee trades sum back
+  to the engine's own turnover and cost.
 - **`test_app.py`** — drives the Streamlit app headlessly with
   `streamlit.testing.v1.AppTest` and monkeypatched (offline) data: both tabs load,
   the Scanner still works, the Backtest runs and renders charts/metrics/tables, a
-  scan→backtest session shares no `st.stop()` leakage, and benchmark-unavailable
-  degrades gracefully.
+  scan→backtest session shares no `st.stop()` leakage, benchmark-unavailable
+  degrades gracefully, and the new controls work — the **start/end date window**,
+  the **Top-N** portfolio-size control, and the entries/exits + transaction-ledger
+  tables.
 
 ---
 

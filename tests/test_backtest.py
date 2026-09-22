@@ -478,6 +478,222 @@ def test_cost_continuity_and_cash_reinvest():
 
 
 # --------------------------------------------------------------------------- #
+# Membership changes (entries / exits) — pure function
+# --------------------------------------------------------------------------- #
+def _hold(*symbols):
+    """Minimal holdings frame with a Symbol column (index = ticker)."""
+    return pd.DataFrame({"Symbol": list(symbols)}, index=[f"{s}.NS" for s in symbols])
+
+
+def test_symbols_helper():
+    check("symbols: None -> []", backtest._symbols(None) == [])
+    check("symbols: empty frame -> []", backtest._symbols(pd.DataFrame()) == [])
+    check("symbols: uses Symbol column", backtest._symbols(_hold("A", "B")) == ["A", "B"])
+    noidx = pd.DataFrame({"weight": [0.5, 0.5]}, index=["A.NS", "B.NS"])
+    check("symbols: falls back to index when no Symbol col",
+          backtest._symbols(noidx) == ["A.NS", "B.NS"])
+
+
+def test_compute_membership_changes():
+    check("membership: no dates -> empty df",
+          backtest.compute_membership_changes({}, []).empty)
+    check("membership: empty df still has the schema columns",
+          list(backtest.compute_membership_changes({}, []).columns)
+          == ["rebalance_date", "n_held", "n_entered", "n_exited", "entered", "exited"])
+
+    d0, d1, d2, d3 = (pd.Timestamp("2022-01-03"), pd.Timestamp("2022-07-01"),
+                      pd.Timestamp("2023-01-02"), pd.Timestamp("2023-07-03"))
+    holdings = {
+        d0: _hold("A", "B", "C"),
+        d1: _hold("A", "B", "C"),   # no churn
+        d2: _hold("A", "B", "D"),   # C out, D in
+        # d3 absent -> cash -> whole book exits
+    }
+    mc = backtest.compute_membership_changes(holdings, [d0, d1, d2, d3])
+    check("membership: one row per rebalance", len(mc) == 4)
+    r0, r1, r2, r3 = (mc.iloc[i] for i in range(4))
+    check("membership: first rebalance all entries",
+          r0["n_entered"] == 3 and r0["n_exited"] == 0)
+    check("membership: entered/exited are sorted comma strings",
+          r0["entered"] == "A, B, C" and r0["exited"] == "")
+    check("membership: stable period -> no churn", r1["n_entered"] == 0 and r1["n_exited"] == 0)
+    check("membership: swap reports one in and one out",
+          r2["entered"] == "D" and r2["exited"] == "C" and r2["n_entered"] == 1 and r2["n_exited"] == 1)
+    check("membership: cash period exits the whole book",
+          r3["n_held"] == 0 and r3["exited"] == "A, B, D" and r3["n_exited"] == 3)
+
+
+# --------------------------------------------------------------------------- #
+# Trade-side classification — every branch
+# --------------------------------------------------------------------------- #
+def test_classify_side():
+    check("side: new position", backtest._classify_side(0.0, 0.2) == "BUY (new)")
+    check("side: full exit", backtest._classify_side(0.2, 0.0) == "SELL (exit)")
+    check("side: increase", backtest._classify_side(0.1, 0.3) == "BUY")
+    check("side: decrease", backtest._classify_side(0.3, 0.1) == "SELL")
+    check("side: unchanged -> HOLD", backtest._classify_side(0.25, 0.25) == "HOLD")
+    check("side: sub-eps change -> HOLD",
+          backtest._classify_side(0.25, 0.25 + 1e-12) == "HOLD")
+
+
+# --------------------------------------------------------------------------- #
+# Trade ledger rows — pure function
+# --------------------------------------------------------------------------- #
+def test_ledger_rows_unit():
+    idx = pd.bdate_range("2022-01-03", periods=30)
+    close = pd.DataFrame({"A.NS": 100.0, "B.NS": 50.0, "C.NS": 25.0}, index=idx).astype(float)
+    t0 = idx[10]
+    meta_map = pd.DataFrame({"Symbol": ["A", "B", "C"], "Company": ["A Co", "B Co", "C Co"]},
+                            index=["A.NS", "B.NS", "C.NS"])
+    empty = pd.Series(dtype="float64")
+    w_new = pd.Series({"A.NS": 0.5, "B.NS": 0.3, "C.NS": 0.2})
+
+    check("ledger: empty both -> []",
+          backtest._ledger_rows(t0, empty, empty, close, 1.0, 0.0, 100.0, meta_map, None) == [])
+
+    # Initial deploy from cash: all BUY (new); targets/traded sum to the base (E0·capital).
+    df = pd.DataFrame(backtest._ledger_rows(t0, w_new, empty, close, 1.0, 10.0, 100.0, meta_map, None))
+    check("ledger: one row per name", len(df) == 3)
+    check("ledger: initial deploy all BUY (new)", set(df["side"]) == {"BUY (new)"})
+    check("ledger: prior_value all zero on first deploy", bool((df["prior_value"] == 0).all()))
+    check("ledger: target_value sums to base", math.isclose(df["target_value"].sum(), 100.0, rel_tol=1e-9))
+    check("ledger: traded_value sums to base on full deploy",
+          math.isclose(df["traded_value"].sum(), 100.0, rel_tol=1e-9))
+    check("ledger: cost sums to rate·base",
+          math.isclose(df["cost"].sum(), (10.0 / 1e4) * 100.0, rel_tol=1e-9))
+    check("ledger: price is the as-of adjusted close",
+          math.isclose(df.set_index("Symbol").loc["A", "price"], 100.0, rel_tol=1e-12))
+    check("ledger: score NaN when meta_now is None", bool(df["score"].isna().all()))
+    check("ledger: rows sorted by traded_value desc", list(df["Symbol"]) == ["A", "B", "C"])
+
+    # meta_map None -> Symbol falls back to ticker, Company blank.
+    df2 = pd.DataFrame(backtest._ledger_rows(t0, w_new, empty, close, 1.0, 0.0, 100.0, None, None))
+    check("ledger: meta_map None -> Symbol=ticker", set(df2["Symbol"]) == {"A.NS", "B.NS", "C.NS"})
+    check("ledger: meta_map None -> Company blank", bool((df2["Company"] == "").all()))
+
+    # meta_map present but missing a ticker -> that name falls back to its ticker.
+    meta_partial = pd.DataFrame({"Symbol": ["A", "B"], "Company": ["A Co", "B Co"]},
+                                index=["A.NS", "B.NS"])
+    df5 = pd.DataFrame(
+        backtest._ledger_rows(t0, w_new, empty, close, 1.0, 0.0, 100.0, meta_partial, None)
+    ).set_index("YFTicker")
+    check("ledger: missing-in-map ticker falls back to ticker symbol",
+          df5.loc["C.NS", "Symbol"] == "C.NS")
+
+    # Rebalance from an existing book: HOLD / SELL (exit) / BUY (new); base scales with E0.
+    w_prev = pd.Series({"A.NS": 0.5, "B.NS": 0.5})   # C not previously held
+    w_tgt = pd.Series({"A.NS": 0.5, "C.NS": 0.5})    # B exits, C new, A holds
+    rows3 = backtest._ledger_rows(t0, w_tgt, w_prev, close, 2.0, 0.0, 100.0, meta_map, None)
+    df3 = pd.DataFrame(rows3).set_index("Symbol")
+    check("ledger: A holds", df3.loc["A", "side"] == "HOLD")
+    check("ledger: B exits", df3.loc["B", "side"] == "SELL (exit)")
+    check("ledger: C new", df3.loc["C", "side"] == "BUY (new)")
+    check("ledger: base scales with E0",
+          math.isclose(df3.loc["A", "target_value"], 0.5 * 2.0 * 100.0, rel_tol=1e-9))
+    check("ledger: HOLD sorts last", pd.DataFrame(rows3).iloc[-1]["side"] == "HOLD")
+
+    # Score sourced from meta_now: present, missing-row, and no-column cases.
+    meta_now = pd.DataFrame({"score": [2.5]}, index=["A.NS"])
+    df4 = pd.DataFrame(
+        backtest._ledger_rows(t0, w_new, empty, close, 1.0, 0.0, 100.0, meta_map, meta_now)
+    ).set_index("Symbol")
+    check("ledger: score taken from meta_now when present",
+          math.isclose(df4.loc["A", "score"], 2.5, rel_tol=1e-12))
+    check("ledger: score NaN for a name absent from meta_now", np.isnan(df4.loc["B", "score"]))
+    meta_now_noscore = pd.DataFrame({"other": [1]}, index=["A.NS"])
+    df7 = pd.DataFrame(
+        backtest._ledger_rows(t0, w_new, empty, close, 1.0, 0.0, 100.0, meta_map, meta_now_noscore)
+    )
+    check("ledger: no score column in meta_now -> all NaN", bool(df7["score"].isna().all()))
+
+
+# --------------------------------------------------------------------------- #
+# Integration: transactions + membership through run_backtest
+# --------------------------------------------------------------------------- #
+def test_transactions_and_membership_integration():
+    pdata, uni, idx = _synthetic_prices(years=5)
+    res = backtest.run_backtest(uni, pdata, _params(pdata, freq=6, cost_bps=25.0, top_n=3))
+
+    tx, mc = res.transactions, res.membership_changes
+    check("integration: transactions non-empty", not tx.empty)
+    check("integration: transactions carry the full schema",
+          {"rebalance_date", "Symbol", "Company", "YFTicker", "side", "price", "prior_weight",
+           "target_weight", "delta_weight", "prior_value", "target_value", "traded_value",
+           "cost", "score"}.issubset(tx.columns))
+    check("integration: membership non-empty", not mc.empty)
+
+    tx_dates = sorted(tx["rebalance_date"].unique())
+    mc_dates = sorted(mc["rebalance_date"])
+    check("integration: ledger dates == membership dates", tx_dates == mc_dates)
+
+    # Transactions cover exactly the simulated t0 boundaries (not the final valuation date).
+    boundary_t0s = sorted(pd.Timestamp(d) for d in res.holdings)
+    check("integration: ledger dates == recorded holdings dates",
+          tx_dates == boundary_t0s)
+
+    # First rebalance: E0 = 1, so targets sum to the initial capital; all are new buys.
+    first = tx[tx["rebalance_date"] == tx_dates[0]]
+    check("integration: first-rebalance targets sum to ₹100",
+          math.isclose(first["target_value"].sum(), 100.0, rel_tol=1e-6))
+    check("integration: first rebalance is all BUY (new)", set(first["side"]) == {"BUY (new)"})
+
+    # Reconcile the ledger against the engine's own turnover/cost, per period.
+    eq, pr = res.equity_curve, res.period_returns
+    ok_turn = ok_cost = True
+    for d in tx_dates:
+        base = float(eq.loc[d]) * 100.0
+        g = tx[tx["rebalance_date"] == d]
+        if not math.isclose(g["traded_value"].sum(), 2.0 * float(pr.loc[d, "turnover"]) * base,
+                            rel_tol=1e-6, abs_tol=1e-9):
+            ok_turn = False
+        if not math.isclose(g["cost"].sum(), float(pr.loc[d, "cost_drag"]) * base,
+                            rel_tol=1e-6, abs_tol=1e-9):
+            ok_cost = False
+    check("integration: Σ traded_value == 2·turnover·base per period", ok_turn)
+    check("integration: Σ cost == cost_drag·base per period", ok_cost)
+
+    # Membership first row: no exits; n_entered == n_held; n_held matches holdings.
+    m0 = mc.iloc[0]
+    check("integration: first membership row has no exits",
+          m0["n_exited"] == 0 and m0["n_entered"] == m0["n_held"])
+    mci = mc.set_index("rebalance_date")
+    check("integration: membership n_held matches holdings sizes",
+          all(int(mci.loc[d, "n_held"]) == len(res.holdings.get(d, [])) for d in mc_dates))
+
+    # initial_capital is a pure display scale: doubling it doubles ledger notional only.
+    res_k = backtest.run_backtest(
+        uni, pdata, replace(_params(pdata, freq=6, cost_bps=25.0, top_n=3), initial_capital=200.0)
+    )
+    fd = sorted(res_k.transactions["rebalance_date"].unique())[0]
+    check("integration: initial_capital scales the ledger",
+          math.isclose(res_k.transactions[res_k.transactions["rebalance_date"] == fd]["target_value"].sum(),
+                       200.0, rel_tol=1e-6))
+    check("integration: initial_capital does not change returns",
+          math.isclose(res_k.metrics["cagr"], res.metrics["cagr"], rel_tol=1e-9))
+
+
+def test_membership_captures_real_churn():
+    """With a reordering universe (top-3 of 6), a sleeper must enter and someone exit."""
+    pdata, uni, idx, cut = _reordering_prices(years=6)
+    sp = ScanParams(asof=idx[-1].date(), top_n=3, apply_listing_filter=False,
+                    apply_liquidity_filter=False, apply_turnover_ratio_filter=False)
+    start = (idx[0] + pd.Timedelta(days=420)).date()
+    p = backtest.BacktestParams(scan_params=sp, start=start, end=idx[-1].date(),
+                                rebalance_months=3, weighting="score")
+    res = backtest.run_backtest(uni, pdata, p)
+    mc = res.membership_changes
+    all_entered = ", ".join(mc["entered"].tolist())
+    check("churn: the sleeper eventually enters", "SLEEP" in all_entered)
+    check("churn: at least one rebalance shows an exit", bool((mc["n_exited"] > 0).any()))
+    # A ledger 'BUY (new)' for the sleeper must exist on the date it enters.
+    enter_dates = mc.loc[mc["entered"].str.contains("SLEEP"), "rebalance_date"].tolist()
+    tx = res.transactions
+    sleeper_buys = tx[(tx["Symbol"] == "SLEEP") & (tx["side"] == "BUY (new)")]
+    check("churn: ledger records the sleeper's entry as a BUY (new)",
+          len(enter_dates) > 0 and bool(sleeper_buys["rebalance_date"].isin(enter_dates).any()))
+
+
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     test_generate_schedule()
     test_target_weights()
@@ -494,6 +710,12 @@ if __name__ == "__main__":
     test_benchmark_alignment()
     test_edge_cases()
     test_cash_period_via_stub()
+    test_symbols_helper()
+    test_compute_membership_changes()
+    test_classify_side()
+    test_ledger_rows_unit()
+    test_transactions_and_membership_integration()
+    test_membership_captures_real_churn()
     print("-" * 50)
     if _failures:
         print(f"{_failures} check(s) FAILED")

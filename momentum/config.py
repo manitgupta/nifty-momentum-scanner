@@ -143,6 +143,10 @@ DOWNLOAD_BATCH_SIZE = 100   # tickers per yfinance.download batch
 BACKTEST_DEFAULT_YEARS = 9
 BACKTEST_MIN_YEARS = 1
 BACKTEST_MAX_YEARS = 15
+# Notional starting capital (₹) used to denominate the transaction ledger and the
+# "Growth of ₹100" chart. Purely a display scale — the equity curve itself is
+# unitless (base 1.0), so changing this never affects returns or metrics.
+BACKTEST_INITIAL_CAPITAL = 100.0
 # Long-history downloads are cached far longer than the 6h live-scan cache: the
 # deep past does not change, so re-fetching multi-year frames is wasteful.
 HISTORY_CACHE_HOURS = 24 * 7

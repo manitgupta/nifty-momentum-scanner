@@ -153,7 +153,7 @@ def test_backtest_happy_path():
     p1, p2, p3 = _patched()
     with p1, p2, p3:
         at = AppTest.from_file(APP, default_timeout=180).run()
-        at.slider(key="bt_years").set_value(5)
+        at.date_input(key="bt_start").set_value(dt.date.today() - dt.timedelta(days=5 * 365))
         at.selectbox(key="bt_freq").set_value("Semi-annual")
         at.button(key="run_bt").click().run()
         check("backtest: no exception", not at.exception, str(at.exception))
@@ -179,7 +179,7 @@ def test_scan_then_backtest_no_stop_leak():
     with p1, p2, p3:
         at = AppTest.from_file(APP, default_timeout=180).run()
         at.button(key="run_scan").click().run()
-        at.slider(key="bt_years").set_value(4)
+        at.date_input(key="bt_start").set_value(dt.date.today() - dt.timedelta(days=4 * 365))
         at.button(key="run_bt").click().run()
         check("both: no exception", not at.exception, str(at.exception))
         check("both: scan result present", bool(ss(at, "scan")))
@@ -196,7 +196,7 @@ def test_backtest_benchmark_unavailable():
          patch("momentum.data.fetch_benchmark", _fake_no_benchmark), \
          patch("momentum.universe.build_universe", _fake_universe):
         at = AppTest.from_file(APP, default_timeout=180).run()
-        at.slider(key="bt_years").set_value(4)
+        at.date_input(key="bt_start").set_value(dt.date.today() - dt.timedelta(days=4 * 365))
         at.button(key="run_bt").click().run()
         check("no-bench: no exception", not at.exception, str(at.exception))
         res = at.session_state["bt"]["res"]
@@ -213,13 +213,88 @@ def test_backtest_too_short_window():
          patch("momentum.data.fetch_benchmark", _fake_benchmark), \
          patch("momentum.universe.build_universe", _fake_universe):
         at = AppTest.from_file(APP, default_timeout=120).run()
-        at.slider(key="bt_years").set_value(1)
+        at.date_input(key="bt_start").set_value(dt.date.today() - dt.timedelta(days=365))
         at.selectbox(key="bt_freq").set_value("Annual")
         at.button(key="run_bt").click().run()
         check("too-short: no exception", not at.exception, str(at.exception))
         check("too-short: error shown", len(at.error) >= 1)
         subs = [s.value for s in at.subheader]
         check("too-short: no equity-curve subheader", "Growth of ₹100" not in subs, str(subs))
+
+
+# --------------------------------------------------------------------------- #
+def test_backtest_date_range():
+    """Explicit start/end date pickers bound the performance window."""
+    p1, p2, p3 = _patched()
+    with p1, p2, p3:
+        start = dt.date.today() - dt.timedelta(days=4 * 365)
+        end = dt.date.today() - dt.timedelta(days=90)
+        at = AppTest.from_file(APP, default_timeout=180).run()
+        at.date_input(key="bt_start").set_value(start)
+        at.date_input(key="bt_end").set_value(end)
+        at.button(key="run_bt").click().run()
+        check("date-range: no exception", not at.exception, str(at.exception))
+        res = at.session_state["bt"]["res"]
+        first, last = res.equity_curve.index[0].date(), res.equity_curve.index[-1].date()
+        check("date-range: curve ends on/before the chosen end", last <= end, f"{last} > {end}")
+        check("date-range: end is respected (well before today)",
+              last <= dt.date.today() - dt.timedelta(days=60), str(last))
+        check("date-range: curve starts near the chosen start",
+              abs((first - start).days) <= 10, f"first={first} start={start}")
+
+
+def test_backtest_start_after_end_errors():
+    """A start on/after the end is rejected with a clear error, no crash."""
+    p1, p2, p3 = _patched()
+    with p1, p2, p3:
+        at = AppTest.from_file(APP, default_timeout=120).run()
+        at.date_input(key="bt_start").set_value(dt.date.today())
+        at.date_input(key="bt_end").set_value(dt.date.today() - dt.timedelta(days=365))
+        at.button(key="run_bt").click().run()
+        check("bad-range: no exception", not at.exception, str(at.exception))
+        check("bad-range: start<end error shown",
+              any("start" in e.value.lower() and "end" in e.value.lower() for e in at.error),
+              str([e.value for e in at.error]))
+
+
+def test_backtest_top_n_holdings():
+    """The Top-N control concentrates the backtested portfolio (e.g. top 2)."""
+    p1, p2, p3 = _patched()
+    with p1, p2, p3:
+        at = AppTest.from_file(APP, default_timeout=180).run()
+        at.date_input(key="bt_start").set_value(dt.date.today() - dt.timedelta(days=5 * 365))
+        at.number_input(key="bt_topn").set_value(2)
+        at.button(key="run_bt").click().run()
+        check("top-n: no exception", not at.exception, str(at.exception))
+        res = at.session_state["bt"]["res"]
+        check("top-n: every rebalance holds at most 2 names",
+              all(len(h) <= 2 for h in res.holdings.values()) and len(res.holdings) > 0)
+        check("top-n: membership n_held capped at 2",
+              int(res.membership_changes["n_held"].max()) <= 2)
+        check("top-n: summary caption mentions the holdings cap",
+              any("up to 2 holdings" in c.value for c in at.caption))
+
+
+def test_backtest_membership_and_ledger_render():
+    """Entries/exits table and the transaction ledger render with real content."""
+    p1, p2, p3 = _patched()
+    with p1, p2, p3:
+        at = AppTest.from_file(APP, default_timeout=180).run()
+        at.date_input(key="bt_start").set_value(dt.date.today() - dt.timedelta(days=6 * 365))
+        at.selectbox(key="bt_freq").set_value("Quarterly")
+        at.button(key="run_bt").click().run()
+        check("ledger-ui: no exception", not at.exception, str(at.exception))
+        res = at.session_state["bt"]["res"]
+        check("ledger-ui: transactions computed", not res.transactions.empty)
+        check("ledger-ui: membership computed", not res.membership_changes.empty)
+
+        cols = [list(df.value.columns) for df in at.dataframe]
+        check("ledger-ui: membership table rendered (Entered/Exited cols)",
+              any("Entered" in c and "Exited" in c for c in cols), str(cols))
+        check("ledger-ui: transaction table rendered (Side/Traded cols)",
+              any("Side" in c and "Traded ₹" in c for c in cols), str(cols))
+        check("ledger-ui: per-rebalance date selector present",
+              any(getattr(s, "key", None) == "bt_tx_date" for s in at.selectbox))
 
 
 # --------------------------------------------------------------------------- #
@@ -261,6 +336,10 @@ if __name__ == "__main__":
     test_scan_then_backtest_no_stop_leak()
     test_backtest_benchmark_unavailable()
     test_backtest_too_short_window()
+    test_backtest_date_range()
+    test_backtest_start_after_end_errors()
+    test_backtest_top_n_holdings()
+    test_backtest_membership_and_ledger_render()
     test_scan_no_segments_error()
     test_whole_index_universe_mode()
     print("-" * 50)

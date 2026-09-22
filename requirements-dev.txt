@@ -1,0 +1,4 @@
+# Optional developer-only tooling. NOT needed to run the app or the tests
+# themselves (those depend only on requirements.txt) — install this to measure
+# test coverage. Kept out of requirements.txt so Streamlit Cloud rebuilds stay fast.
+coverage>=7.0
