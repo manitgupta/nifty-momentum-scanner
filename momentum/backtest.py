@@ -105,7 +105,10 @@ def _required_history_days(sp: ScanParams) -> int:
         max(sp.lookback_long_months, sp.lookback_short_months, sp.vol_lookback_months)
         + sp.skip_months
     )
-    return int(round(months * 30.44)) + 45  # month≈30.44d + holiday buffer
+    days = int(round(months * 30.44)) + 45  # month≈30.44d + holiday buffer
+    if sp.apply_listing_filter:  # the listing-age filter needs that much history too
+        days = max(days, int(sp.min_listing_days) + 45)
+    return days
 
 
 def freq_spec(params: BacktestParams) -> tuple[str, int]:
@@ -155,7 +158,9 @@ def generate_schedule(
 
     rows: list[dict] = []
     seen: set[pd.Timestamp] = set()
-    d = pd.Timestamp(start)
+    start_ts = pd.Timestamp(start)
+    k = 0
+    d = start_ts
     while d <= end_ts:
         td = _last_trading_day(cal, d)
         used, reason = False, ""
@@ -167,7 +172,10 @@ def generate_schedule(
             used = True
             seen.add(td)
         rows.append({"scheduled_date": d, "trading_date": td, "used": used, "reason": reason})
-        d = d + delta
+        # Offset from the START each time (not cumulatively) so month-end starts
+        # don't drift: Jan 31 → Feb 29 → Mar 31, not … → Mar 29.
+        k += 1
+        d = start_ts + delta * k
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -453,7 +461,8 @@ def _symbols(h: pd.DataFrame | None) -> list[str]:
     if h is None or h.empty:
         return []
     if "Symbol" in h.columns:
-        return h["Symbol"].tolist()
+        # Fall back to the ticker where a symbol is missing (keeps sorting well-typed).
+        return [str(s) if pd.notna(s) else str(t) for s, t in zip(h["Symbol"], h.index)]
     return [str(t) for t in h.index]
 
 
@@ -666,10 +675,13 @@ def run_backtest(
 
     # -- regime ------------------------------------------------------------- #
     regime: dict[pd.Timestamp, bool | None] = {}
+    regime_has_data = False
     if params.regime_filter:
         src = regime_series if regime_series is not None else benchmark_series
-        regime = regime_states(src, rb, params.regime_ma_days)
-        if src is None or len(src) == 0:
+        regime_has_data = src is not None and len(src) > 0
+        if regime_has_data:
+            regime = regime_states(src, rb, params.regime_ma_days)
+        else:
             notes.append("Regime filter requested but no regime index data — filter not applied.")
 
     # -- PASS A: point-in-time selection (uses only prices <= entry) --------- #
@@ -720,6 +732,16 @@ def run_backtest(
     tx_rows: list[dict] = []
     contrib_rows: list[dict] = []
 
+    def _cash_row(t0, t1, frac: float, base: float, growth_minus_1: float) -> None:
+        """Attribute the cash sleeve's yield so Σ contributions − costs == equity gain."""
+        if frac > 0 and growth_minus_1 != 0:
+            c = base * frac * growth_minus_1
+            contrib_rows.append({
+                "period_start": t0, "period_end": t1, "YFTicker": "CASH", "Symbol": "Cash",
+                "weight": frac, "ret": growth_minus_1,
+                "contribution": c, "contribution_inr": c * params.initial_capital,
+            })
+
     for i in range(len(boundary) - 1):
         t0, t1 = boundary[i], boundary[i + 1]
         w = weights_by_date.get(t0, pd.Series(dtype="float64"))
@@ -740,6 +762,7 @@ def run_backtest(
             for d, g in zip(days, growth):
                 eq[d] = E * float(g)
             if len(days):
+                _cash_row(t0, t1, 1.0, E, float(growth[-1]) - 1.0)
                 E = E * float(growth[-1])
             w_prev = pd.Series(dtype="float64")
             sret = E / E0 - 1.0
@@ -766,6 +789,8 @@ def run_backtest(
                     "weight": float(w[tk]), "ret": float(r[tk]),
                     "contribution": contrib, "contribution_inr": contrib * params.initial_capital,
                 })
+            if exposure < 1.0:
+                _cash_row(t0, t1, 1.0 - exposure, E_start, float((1.0 + cash_daily) ** len(days)) - 1.0)
 
         prows.append({
             "rb_date": t0, "period_start": t0, "period_end": t1,
@@ -789,7 +814,7 @@ def run_backtest(
     # Membership churn over the periods actually simulated (the t0 boundaries).
     membership_changes = compute_membership_changes(holdings, list(boundary[:-1]))
 
-    if params.regime_filter and regime:
+    if params.regime_filter and regime_has_data:
         sim = period_returns["risk_on"]
         n_off = int((sim == False).sum())  # noqa: E712 — tri-state (None = no data yet)
         notes.append(

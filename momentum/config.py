@@ -293,6 +293,12 @@ PRICE_LOOKBACK_DAYS = 400
 MARKETCAP_MAX_WORKERS = 12  # threads for per-ticker fast_info calls
 DOWNLOAD_BATCH_SIZE = 100   # tickers per yfinance.download batch
 
+# Bad-print guard: drop closes more than SPIKE_FACTOR× away from their centred
+# SPIKE_WINDOW-day rolling median (catches Yahoo's few-day mis-scaled blips around
+# ETF splits; persistent level changes are never flagged). See data.clean_price_spikes.
+SPIKE_FACTOR = 3.0
+SPIKE_WINDOW = 9
+
 # --------------------------------------------------------------------------- #
 # Backtesting
 # --------------------------------------------------------------------------- #

@@ -481,6 +481,13 @@ def run_scan(universe: pd.DataFrame, price_data, params: ScanParams) -> ScanResu
     """
     close, volume, market = price_data.close, price_data.volume, price_data.market
     notes: list[str] = []
+    # The universe defines the eligible set: ignore price columns for tickers
+    # outside it (e.g. a stale cache holding names since dropped from the index).
+    uni_tickers = set(universe["YFTicker"])
+    if close is not None and not close.empty and not set(close.columns) <= uni_tickers:
+        keep = [t for t in close.columns if t in uni_tickers]
+        close = close[keep]
+        volume = volume.reindex(columns=keep) if volume is not None else volume
 
     momentum = compute_momentum(close, params)
     liquidity = compute_liquidity(close, volume, market, params)

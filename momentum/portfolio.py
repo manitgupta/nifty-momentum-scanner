@@ -47,6 +47,10 @@ def allocate(selected: pd.DataFrame, capital: float, top_up: bool = True) -> tup
     """
     t = _targets(selected)
     ok = t["price"].gt(0) & t["price"].notna()
+    # Names without a usable price can't be bought: spread their weight over the rest.
+    if ok.any() and not ok.all():
+        t.loc[ok, "weight"] = t.loc[ok, "weight"] / t.loc[ok, "weight"].sum()
+        t.loc[~ok, "weight"] = 0.0
     target_value = capital * t["weight"]
     shares = np.where(ok, np.floor(target_value / t["price"].where(ok, 1.0)), 0).astype(int)
     invested = shares * t["price"].fillna(0.0)
@@ -131,17 +135,20 @@ def rebalance_orders(
     """Orders that move ``current`` holdings onto the ``selected`` target weights.
 
     Portfolio value = Σ current qty × price (+ ``extra_cash`` to add, or negative
-    to withdraw). Target quantities are whole-share allocations of that value.
-    Held names outside the target are sold in full; a held name with no known
-    price is flagged ``REVIEW`` (it cannot be valued) and left untouched.
+    to withdraw; a withdrawal larger than the portfolio is capped at "sell
+    everything" and flagged in the summary). Target quantities are whole-share
+    allocations of that value. Held names outside the target are sold in full;
+    any name with no known price is flagged ``REVIEW`` (it cannot be valued or
+    traded) and left untouched.
     Returns (orders, summary) — orders columns: Symbol, action, qty, price,
     value, current_qty, target_qty, target_weight.
     """
     t = _targets(selected)
     px = {**prices, **{s: p for s, p in zip(t["Symbol"], t["price"]) if pd.notna(p)}}
     held_value = sum(q * px[s] for s, q in current.items() if s in px and pd.notna(px[s]))
-    total = held_value + float(extra_cash)
-    alloc, leftover = allocate(selected, max(total, 0.0))
+    requested = held_value + float(extra_cash)
+    total = max(requested, 0.0)
+    alloc, leftover = allocate(selected, total)
     target_qty = dict(zip(alloc["Symbol"], alloc["shares"]))
     target_w = dict(zip(alloc["Symbol"], alloc["target_weight"]))
 
@@ -149,9 +156,9 @@ def rebalance_orders(
     for sym in list(dict.fromkeys(list(t["Symbol"]) + list(current))):
         cur = int(current.get(sym, 0))
         price = px.get(sym, np.nan)
-        if sym not in target_qty and (price is None or not np.isfinite(price)):
+        if price is None or not np.isfinite(price) or price <= 0:
             rows.append({"Symbol": sym, "action": "REVIEW", "qty": 0, "price": np.nan, "value": np.nan,
-                         "current_qty": cur, "target_qty": np.nan, "target_weight": 0.0})
+                         "current_qty": cur, "target_qty": np.nan, "target_weight": float(target_w.get(sym, 0.0))})
             continue
         tgt = int(target_qty.get(sym, 0))
         delta = tgt - cur
@@ -170,6 +177,7 @@ def rebalance_orders(
         "buy_value": buys, "sell_value": sells, "cash_after": float(total - (alloc["invested"].sum())),
         "n_buys": int((orders["action"] == "BUY").sum()), "n_sells": int((orders["action"] == "SELL").sum()),
         "n_review": int((orders["action"] == "REVIEW").sum()),
+        "withdrawal_shortfall": float(max(-requested, 0.0)),
     }
     return orders.reset_index(drop=True), summary
 

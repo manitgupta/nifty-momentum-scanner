@@ -850,6 +850,42 @@ def test_contributions_reconcile():
           np.allclose(c["contribution_inr"], c["contribution"] * p.initial_capital))
 
 
+def test_review_fixes():
+    """Cash-yield attribution, regime notes without data, schedule drift, listing history."""
+    pdata, uni, idx2 = _wide_prices(years=5)
+    n = len(idx2)
+    t = np.arange(n)
+    bench = pd.Series(np.where(t < n * 0.55, 100 * np.exp(0.0006 * t), 100 * np.exp(0.0006 * n * 0.55 - 0.0009 * (t - n * 0.55))),
+                      index=idx2)
+    p = replace(_params(pdata, top_n=4, cost_bps=30.0), rebalance_freq="Monthly", regime_filter=True,
+                regime_exposure_off=0.4, cash_yield_annual=0.07)
+    r = backtest.run_backtest(uni, pdata, p, benchmark_series=bench)
+    c = r.contributions
+    cost_units = r.transactions["cost"].sum() / p.initial_capital
+    gain = float(r.equity_curve.iloc[-1] - 1.0)
+    check("cash-attrib: Cash rows present when yield > 0", (c["YFTicker"] == "CASH").any())
+    check("cash-attrib: Σ contributions (incl. cash) − costs == equity gain",
+          math.isclose(c["contribution"].sum() - cost_units, gain, rel_tol=1e-9, abs_tol=1e-12),
+          f"{c['contribution'].sum() - cost_units} vs {gain}")
+
+    empty = backtest.run_backtest(uni, pdata, replace(p, cash_yield_annual=0.0), benchmark_series=pd.Series(dtype=float))
+    reg_notes = [nt for nt in empty.notes if "egime" in nt]
+    check("regime-notes: no data → exactly one explanatory note", len(reg_notes) == 1, str(reg_notes))
+
+    cal = pd.bdate_range("2024-01-01", "2024-12-31")
+    sched = backtest.generate_schedule(cal, dt.date(2024, 1, 31), dt.date(2024, 6, 30), 1, unit="months")
+    sd = [d.date() for d in sched["scheduled_date"]]
+    check("schedule: month-end start does not drift (Mar 31, Apr 30, May 31)",
+          sd[:5] == [dt.date(2024, 1, 31), dt.date(2024, 2, 29), dt.date(2024, 3, 31),
+                     dt.date(2024, 4, 30), dt.date(2024, 5, 31)], str(sd))
+
+    sp = ScanParams(asof=dt.date(2026, 1, 1), lookback_long_months=6, lookback_short_months=3, vol_lookback_months=6)
+    check("history: listing filter forces ≥ 1y + buffer of history",
+          backtest._required_history_days(sp) >= sp.min_listing_days + 45)
+    check("history: without listing filter the lookback decides",
+          backtest._required_history_days(replace(sp, apply_listing_filter=False)) < 365)
+
+
 def test_universe_equal_weight():
     idx = pd.bdate_range("2024-01-01", periods=4)
     close = pd.DataFrame({"A": [100, 110, 121, 121], "B": [50, 50, np.nan, 55]}, index=idx, dtype=float)
@@ -900,6 +936,7 @@ if __name__ == "__main__":
     test_rank_buffer_reduces_turnover()
     test_sector_cap_and_inverse_vol()
     test_contributions_reconcile()
+    test_review_fixes()
     test_universe_equal_weight()
     test_sweep_matches_individual_runs()
     test_no_lookahead_with_new_features()

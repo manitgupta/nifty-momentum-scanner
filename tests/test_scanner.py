@@ -330,7 +330,27 @@ def test_scheme_weights_and_weighting_modes():
     check("select_and_weight: live rank buffer keeps a held name", list(out.index) == ["C"])
 
 
+def test_run_scan_ignores_tickers_outside_universe():
+    """A stale price cache may hold names no longer in the index — never rank them."""
+    idx = pd.bdate_range("2024-01-01", "2026-06-30")
+    t = np.arange(len(idx))
+    close = pd.DataFrame({"IN1.NS": 100 * np.exp(0.0005 * t), "IN2.NS": 100 * np.exp(0.0003 * t),
+                          "GONE.NS": 100 * np.exp(0.002 * t)}, index=idx)
+    vol = pd.DataFrame(1e6, index=idx, columns=close.columns)
+    market = pd.DataFrame({"market_cap": 1e11, "shares": 1e9, "last_price": 1.0}, index=close.columns)
+    pdata = PriceData(close=close, raw_close=close, volume=vol, market=market, failed=[])
+    uni = pd.DataFrame({"Symbol": ["IN1", "IN2"], "Company": ["a", "b"], "Industry": ["X", "Y"],
+                        "Segment": "L", "YFTicker": ["IN1.NS", "IN2.NS"]})
+    res = scanner.run_scan(uni, pdata, scanner.ScanParams(asof=dt.date(2026, 6, 30), top_n=3,
+                                                          apply_liquidity_filter=False,
+                                                          apply_turnover_ratio_filter=False))
+    check("universe guard: out-of-universe ticker not ranked", "GONE.NS" not in res.results.index)
+    check("universe guard: every selected name has a symbol", res.selected["Symbol"].notna().all()
+          and set(res.selected.index) == {"IN1.NS", "IN2.NS"})
+
+
 if __name__ == "__main__":
+    test_run_scan_ignores_tickers_outside_universe()
     test_asof_price()
     test_asof_closes()
     test_score_piecewise()

@@ -71,6 +71,26 @@ def _is_fresh(path: Path, max_age_hours: float) -> bool:
     return path.exists() and (time.time() - path.stat().st_mtime) < max_age_hours * 3600
 
 
+def clean_price_spikes(prices, factor: float = config.SPIKE_FACTOR, window: int = config.SPIKE_WINDOW):
+    """Blank out short-lived bad prints (Frame or Series), leaving NaN to be ffilled.
+
+    Yahoo occasionally serves a few days of wrongly-scaled closes — e.g. GOLDBEES
+    at 0.3355 instead of 33.55 around a split, then back. Such a blip fakes a
+    -99% / +9,900% round trip that wrecks volatility, drawdowns and equal-weight
+    averages. A close is dropped when it sits more than ``factor``× above or
+    below the centred ``window``-day rolling median. Because the median is
+    centred, a *persistent* level change is never flagged — only moves that
+    revert within ~window/2 sessions — and NSE circuit limits (≤20%/day) make a
+    genuine 3× move inside that span essentially impossible.
+    """
+    if prices is None or len(prices) == 0:
+        return prices
+    med = prices.rolling(window, center=True, min_periods=1).median()
+    ratio = prices / med
+    bad = (ratio > factor) | (ratio < 1.0 / factor)
+    return prices.mask(bad)
+
+
 def _download_batch(
     tickers: list[str], start: dt.date, end: dt.date
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -140,9 +160,15 @@ def fetch_prices(
         and rawclose_path.exists()
         and volume_path.exists()
     ):
-        close = pd.read_parquet(close_path)
-        raw_close = pd.read_parquet(rawclose_path)
+        close = clean_price_spikes(pd.read_parquet(close_path))
+        raw_close = clean_price_spikes(pd.read_parquet(rawclose_path))
         volume = pd.read_parquet(volume_path)
+        # A cache written for an older constituent list may hold extra tickers
+        # (names since dropped from the index): return only what was asked for.
+        keep = [t for t in dict.fromkeys(tickers) if t in close.columns]
+        close = close[keep]
+        raw_close = raw_close.reindex(columns=keep)
+        volume = volume.reindex(columns=keep)
         if progress:
             progress(len(tickers), len(tickers))
         return close, raw_close, volume
@@ -175,8 +201,8 @@ def fetch_prices(
     raw_close = pd.concat(raws, axis=1).sort_index()
     volume = pd.concat(volumes, axis=1).sort_index()
     # Drop all-NaN columns (tickers Yahoo had nothing for) and align the others.
-    close = close.dropna(axis=1, how="all")
-    raw_close = raw_close.reindex(columns=close.columns)
+    close = clean_price_spikes(close.dropna(axis=1, how="all"))
+    raw_close = clean_price_spikes(raw_close.reindex(columns=close.columns))
     volume = volume.reindex(columns=close.columns)
 
     close.to_parquet(close_path)
@@ -213,7 +239,7 @@ def _yahoo_history(ticker: str, start: dt.date, asof: dt.date) -> pd.Series:
     close = raw["Close"]
     if isinstance(close, pd.DataFrame):  # single ticker can still come back wide
         close = close.iloc[:, 0]
-    close = close.dropna()
+    close = clean_price_spikes(close.dropna()).dropna()
     close.name = "close"
     return close
 

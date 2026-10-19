@@ -237,8 +237,12 @@ def _base_scan_params(asof_date: dt.date) -> scanner.ScanParams:
 
 
 def _history_start(end_date: dt.date, extra_years: int = 0) -> dt.date:
-    """Earliest fetch date covering the longest configured window (+ backtest span)."""
-    span_months = max(int(lb_long), int(lb_short), int(vol_m)) + int(skip_m)
+    """Earliest fetch date covering the longest configured window (+ backtest span).
+
+    Never less than 12 months: the 1-year listing filter measures listing age
+    from the first fetched close, so a shorter fetch would mark every stock "new".
+    """
+    span_months = max(int(lb_long), int(lb_short), int(vol_m), 12) + int(skip_m)
     return (
         end_date
         - relativedelta(years=extra_years)
@@ -556,8 +560,11 @@ def _render_portfolio_builder(scan: dict, selected: pd.DataFrame, full: pd.DataF
         k[2].metric("Buy", f"{summ['n_buys']} · {portfolio.round_lakh(summ['buy_value'])}")
         k[3].metric("Cash after", portfolio.round_lakh(summ["cash_after"]))
         if summ["n_review"]:
-            st.warning(f"{summ['n_review']} holding(s) are outside the scanned universe, so they can't be "
-                       "priced — marked REVIEW and left untouched.")
+            st.warning(f"{summ['n_review']} name(s) have no price in this scan (e.g. outside the scanned "
+                       "universe) — marked REVIEW and left untouched.")
+        if summ.get("withdrawal_shortfall", 0) > 0:
+            st.warning(f"The withdrawal exceeds the priced portfolio by "
+                       f"{portfolio.round_lakh(summ['withdrawal_shortfall'])} — the orders sell everything.")
         st.dataframe(
             orders.assign(target_weight=(orders["target_weight"] * 100).round(2), price=orders["price"].round(2),
                           value=orders["value"].round(0)),
@@ -618,6 +625,11 @@ def render_scan_tab() -> None:
     )
     disp = _format_selected(selected, cols)
     st.dataframe(disp, hide_index=True, width="stretch", column_config=_colcfg(cols))
+    calm = selected[selected["sigma"] < 0.03]["Symbol"].tolist() if "sigma" in selected else []
+    if calm:
+        st.warning(f"Very low volatility: {', '.join(calm)}. Volatility-adjusted momentum (return ÷ σ) rates "
+                   "near-riskless instruments such as liquid/gilt ETFs extremely highly, so they can crowd out "
+                   "everything else. Remove them from the universe unless you want a defensive sleeve.")
 
     st.download_button(
         "⬇️ Download selection (CSV)",
@@ -993,7 +1005,8 @@ def _render_attribution(res: backtest.BacktestResult) -> None:
     else:
         cap = res.params.initial_capital if res.params else config.BACKTEST_INITIAL_CAPITAL
         st.caption(f"P&L each name added on a ₹{cap:,.0f} starting capital (before costs), summed over every "
-                   "period it was held. Win rate = share of its holding periods that made money.")
+                   "period it was held. Win rate = share of its holding periods that made money. 'Cash' is the "
+                   "yield earned on uninvested cash, if any.")
         top = pd.concat([summ.head(10), summ.tail(10)]).drop_duplicates("Symbol")
         st.altair_chart(charts.diverging_bars(top, "Symbol", "contribution_inr", ",.1f",
                                               f"Contribution (₹ on ₹{cap:,.0f})", PAL,
@@ -1009,9 +1022,10 @@ def _render_attribution(res: backtest.BacktestResult) -> None:
         st.dataframe(view, hide_index=True, width="stretch",
                      column_config={c: PCT_FMT for c in ["Avg wt %", "Win rate %", "Return while held %",
                                                          "Best period %", "Worst period %"]})
-        pr = res.contributions
-        st.caption(f"Picks hit rate: {_pct(float((pr['ret'] > 0).mean()), 0)} of {len(pr):,} position-periods "
-                   f"were profitable · {summ.shape[0]} distinct names held.")
+        pr = res.contributions[res.contributions["YFTicker"] != "CASH"]
+        if len(pr):
+            st.caption(f"Picks hit rate: {_pct(float((pr['ret'] > 0).mean()), 0)} of {len(pr):,} position-periods "
+                       f"were profitable · {pr['Symbol'].nunique()} distinct names held.")
 
     st.subheader("🏭 Sector exposure over time")
     sx = analytics.sector_exposure(res.holdings, res.period_returns.index)
@@ -1268,7 +1282,7 @@ def render_backtest_controls() -> dict:
     default_start = default_end - relativedelta(years=config.BACKTEST_DEFAULT_YEARS)
     d = st.columns(2)
     bt_start = d[0].date_input(
-        "Backtest start", value=default_start, max_value=default_end, key="bt_start",
+        "Backtest start", value=default_start, max_value=dt.date.today(), key="bt_start",
         help="Performance is measured between these two dates. The first rebalance may be "
         "pushed later automatically if there isn't enough prior price history for a scan.",
     )

@@ -331,6 +331,10 @@ not precise — both are surfaced in the UI rather than hidden:
 - **Benchmarks** — NSE TRI/price indices come from niftyindices.com (back-calculated
   before each index's launch date, e.g. Microcap 250 and the momentum indices).
   The regime filter and the scanner banner use the price index.
+- **Bad Yahoo prints** — Yahoo occasionally serves a few days of wrongly-scaled
+  closes (e.g. several ETFs at 1/10–1/100 of their price around Dec 2019). Closes
+  more than 3× away from their centred 9-day median are dropped and forward-filled
+  (`data.clean_price_spikes`); persistent level changes are never touched.
 - **Daily / weekly rebalancing** — modelled at the close with the configured cost;
   real-world slippage at that turnover can be much higher, so use realistic costs
   and/or the rank buffer.

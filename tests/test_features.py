@@ -327,6 +327,57 @@ def test_nse_index_history_parsing():
             check("nse: unexpected format raises a clear error", True)
 
 
+def test_clean_price_spikes():
+    idx = pd.bdate_range("2019-12-02", periods=30)
+    gold = pd.Series(np.linspace(33.0, 34.5, 30), index=idx)
+    gold.iloc[13:15] = gold.iloc[13:15] / 100.0          # Yahoo's 2-day mis-scaled blip (33.6 → 0.336)
+    clean = data.clean_price_spikes(gold)
+    check("spikes: 2-day ÷100 blip blanked", clean.iloc[13:15].isna().all() and clean.drop(idx[13:15]).notna().all())
+    up = pd.Series(np.linspace(100, 101, 30), index=idx)
+    up.iloc[20] = 1000.0                                   # single ×10 print
+    check("spikes: single ×10 print blanked", np.isnan(data.clean_price_spikes(up).iloc[20]))
+    lvl = pd.Series(np.r_[np.full(15, 300.0), np.full(15, 30.0)], index=idx)  # persistent ÷10 (unadjusted split)
+    check("spikes: persistent level change kept", data.clean_price_spikes(lvl).notna().all())
+    crash = pd.Series(np.r_[np.full(15, 100.0), 100 * 0.8 ** np.arange(1, 16)], index=idx)  # -20%/day limit-downs
+    check("spikes: genuine 20%/day slide kept", data.clean_price_spikes(crash).notna().all())
+    frame = pd.DataFrame({"A": gold, "B": lvl})
+    cf = data.clean_price_spikes(frame)
+    check("spikes: frame cleaned column-wise", int(cf["A"].isna().sum()) == 2 and cf["B"].notna().all())
+    check("spikes: empty passthrough", data.clean_price_spikes(pd.DataFrame()).empty)
+
+
+def test_price_cache_filters_and_cleans():
+    """Cached frames come back cleaned and limited to the requested tickers."""
+    idx = pd.bdate_range("2024-01-01", periods=40)
+    a = pd.Series(np.linspace(100, 110, 40), index=idx)
+    a.iloc[20] = a.iloc[20] / 100  # a blip baked into an old cache
+    frame = pd.DataFrame({"A.NS": a, "B.NS": 50.0, "GONE.NS": 10.0}, index=idx)
+    key = "t_cachefilter"
+    for prefix in ("close", "rawclose", "volume"):
+        frame.to_parquet(config.DATA_DIR / f"{prefix}_{key}.parquet")
+    c, rc, v = data.fetch_prices(["A.NS", "B.NS", "NEW.NS"], key, asof=idx[-1].date(), cache_hours=1)
+    check("cache: only requested tickers returned (stale names dropped)", list(c.columns) == ["A.NS", "B.NS"]
+          and list(rc.columns) == ["A.NS", "B.NS"] and list(v.columns) == ["A.NS", "B.NS"])
+    check("cache: blips cleaned on read", np.isnan(c["A.NS"].iloc[20]) and np.isnan(rc["A.NS"].iloc[20]))
+    for prefix in ("close", "rawclose", "volume"):
+        (config.DATA_DIR / f"{prefix}_{key}.parquet").unlink(missing_ok=True)
+
+
+def test_portfolio_edge_cases():
+    sel = SEL.assign(close_price=[1000.0, 333.0, np.nan])  # C unpriced
+    t, _ = portfolio.allocate(sel, 100_000)
+    check("allocate: unpriced target's weight redistributed (≥95% invested)", t["invested"].sum() >= 95_000,
+          str(t["invested"].sum()))
+    orders, s = portfolio.rebalance_orders(sel, {"C": 10, "A": 5}, {})
+    o = orders.set_index("Symbol")
+    check("orders: held + targeted but unpriced → REVIEW (not SELL)", o.loc["C", "action"] == "REVIEW"
+          and o.loc["C", "qty"] == 0)
+    o2, s2 = portfolio.rebalance_orders(SEL, {"A": 2}, {}, extra_cash=-5_000)
+    check("orders: over-withdrawal clamps to sell-all + reports shortfall",
+          s2["target_value"] == 0 and math.isclose(s2["withdrawal_shortfall"], 3_000)
+          and o2.set_index("Symbol").loc["A", "action"] == "SELL" and s2["cash_after"] >= 0)
+
+
 def test_benchmark_snapshot_file():
     ok = data.BENCHMARK_SEED_PATH.exists()
     check("snapshot: bundled benchmarks.parquet exists", ok)
@@ -351,6 +402,9 @@ if __name__ == "__main__":
     test_chain_extend()
     test_fetch_benchmark_ladder()
     test_nse_index_history_parsing()
+    test_clean_price_spikes()
+    test_price_cache_filters_and_cleans()
+    test_portfolio_edge_cases()
     test_benchmark_snapshot_file()
     print("-" * 50)
     if _failures:
