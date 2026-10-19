@@ -57,7 +57,10 @@ def line_chart(wide: pd.DataFrame, colors: dict[str, str], y_title: str, pal: di
                       legend=alt.Legend(orient="top", title=None))
     y = alt.Y("Value:Q", title=y_title, axis=alt.Axis(format=y_fmt),
               scale=alt.Scale(type="log") if log else alt.Scale(zero=False))
-    base = alt.Chart(long).encode(x=alt.X("Date:T", title=None), y=y, color=color)
+    span_years = (wide.index.max() - wide.index.min()).days / 365.25 if len(wide) else 0
+    # Multi-year charts: one tick per year (Vega's default adds Apr/Jul/Oct and clutters).
+    x_axis = alt.Axis(format="%Y", tickCount={"interval": "year", "step": 1}) if span_years >= 3 else alt.Axis()
+    base = alt.Chart(long).encode(x=alt.X("Date:T", title=None, axis=x_axis), y=y, color=color)
     lines = base.mark_line(strokeWidth=2).encode(
         strokeDash=alt.condition(alt.FieldOneOfPredicate(field="Series", oneOf=list(dashed) or ["__none__"]),
                                  alt.value([4, 3]), alt.value([1, 0])))
@@ -74,15 +77,19 @@ def line_chart(wide: pd.DataFrame, colors: dict[str, str], y_title: str, pal: di
 
 
 def diverging_bars(df: pd.DataFrame, cat: str, val: str, fmt: str, title: str, pal: dict,
-                   height: int = 380) -> alt.Chart:
-    """Horizontal bars coloured by sign (blue ↑ / red ↓), sorted by value."""
+                   step: int = 24) -> alt.Chart:
+    """Horizontal bars coloured by sign (blue ↑ / red ↓), sorted by value.
+
+    Sized per bar (``step`` px) rather than by total height: Streamlit fits a
+    fixed height around axes too, which squeezed bands and dropped labels.
+    """
     color = alt.condition(alt.datum[val] >= 0, alt.value(pal["pos"]), alt.value(pal["neg"]))
     return (alt.Chart(df).mark_bar(cornerRadiusEnd=4, height={"band": 0.7})
             .encode(y=alt.Y(f"{cat}:N", sort=alt.EncodingSortField(field=val, order="descending"), title=None),
                     x=alt.X(f"{val}:Q", title=title, axis=alt.Axis(format=fmt)),
                     color=color,
                     tooltip=[alt.Tooltip(f"{cat}:N"), alt.Tooltip(f"{val}:Q", format=fmt)])
-            .properties(height=height))
+            .properties(height=alt.Step(step)))
 
 
 def calendar_heatmap(table: pd.DataFrame, pal: dict) -> alt.LayerChart:
@@ -106,7 +113,7 @@ def calendar_heatmap(table: pd.DataFrame, pal: dict) -> alt.LayerChart:
             .encode(x=x, y=y, text=alt.Text("ret:Q", format=".1%"),
                     color=alt.condition(f"abs(datum.ret) > {lim * 0.55}", alt.value("#ffffff"),
                                         alt.value(pal["ink"]))))
-    return alt.layer(rect, text).properties(height=max(160, 28 * table.shape[0]))
+    return alt.layer(rect, text).properties(height=alt.Step(30))
 
 
 def sector_bar(sec: pd.DataFrame, pal: dict) -> alt.Chart:
@@ -116,7 +123,16 @@ def sector_bar(sec: pd.DataFrame, pal: dict) -> alt.Chart:
                     x=alt.X("weight:Q", title="Weight", axis=alt.Axis(format="%")),
                     tooltip=[alt.Tooltip("Industry:N"), alt.Tooltip("weight:Q", format=".1%"),
                              alt.Tooltip("names:Q", title="Names")])
-            .properties(height=max(160, 22 * len(sec))))
+            .properties(height=alt.Step(26)))
+
+
+def weights_bar(df: pd.DataFrame, pal: dict, label: str = "Symbol", value: str = "Weight") -> alt.Chart:
+    """Portfolio weights, largest first (``value`` in percent units, e.g. 5.0 = 5%)."""
+    return (alt.Chart(df).mark_bar(cornerRadiusEnd=4, color=pal["series"][0])
+            .encode(x=alt.X(f"{label}:N", sort="-y", title=None, axis=alt.Axis(labelAngle=-60)),
+                    y=alt.Y(f"{value}:Q", title="Weight (%)"),
+                    tooltip=[alt.Tooltip(f"{label}:N"), alt.Tooltip(f"{value}:Q", format=".2f", title="Weight %")])
+            .properties(height=320))
 
 
 def sector_area(sx: pd.DataFrame, pal: dict, top: int = 7, max_points: int = 300) -> alt.Chart:
@@ -165,4 +181,4 @@ def metric_heatmap(table: pd.DataFrame, metric: str, order: list[str], pal: dict
     text = heat.mark_text(fontSize=13).encode(
         text=alt.Text(f"{metric}:Q", format=fmt),
         color=alt.condition(f"datum.{metric} {op} {cut}", alt.value("#ffffff"), alt.value(pal["ink"])))
-    return alt.layer(rect, text).properties(height=max(140, 48 * len(order)))
+    return alt.layer(rect, text).properties(height=alt.Step(48))

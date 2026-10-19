@@ -906,6 +906,19 @@ def test_sweep_matches_individual_runs():
     check("sweep: cached-scan result == standalone run (CAGR)", math.isclose(row["cagr"], single.metrics["cagr"], rel_tol=1e-12))
     check("sweep: equity curve identical", curves["Quarterly · Top 2"].equals(single.equity_curve))
 
+    # With the regime filter on, every sweep cell must equal a standalone run too.
+    n = len(pdata.close)
+    t = np.arange(n)
+    bench = pd.Series(np.where(t < n * 0.55, 100 * np.exp(0.0006 * t),
+                               100 * np.exp(0.0006 * n * 0.55 - 0.0009 * (t - n * 0.55))), index=pdata.close.index)
+    rbase = replace(base, regime_filter=True, cash_yield_annual=0.05)
+    rtable, rcurves = backtest.run_sweep(uni, pdata, rbase, [2, 4], ["Monthly", "Weekly"], benchmark_series=bench)
+    rsingle = backtest.run_backtest(uni, pdata, replace(rbase, rebalance_freq="Weekly",
+                                                        scan_params=replace(rbase.scan_params, top_n=4), exit_rank=8),
+                                    benchmark_series=bench)
+    check("sweep+regime: cell == standalone run", rcurves["Weekly · Top 4"].equals(rsingle.equity_curve))
+    check("sweep+regime: filter actually engaged", bool((rsingle.period_returns["risk_on"] == False).any()))  # noqa: E712
+
 
 def test_no_lookahead_with_new_features():
     """Weekly cadence + buffer + sector cap + regime must remain look-ahead-free."""

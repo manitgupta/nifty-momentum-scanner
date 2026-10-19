@@ -501,7 +501,8 @@ def _render_portfolio_builder(scan: dict, selected: pd.DataFrame, full: pd.DataF
     st.caption("Turn the selection into an order list at the as-of closing prices. Quantities are whole "
                "shares; actual fills will differ slightly from these closes.")
     b1, b2 = st.columns([1, 2])
-    capital = b1.number_input("Capital to invest (₹)", 1_000.0, 1e10, 1_000_000.0, step=50_000.0,
+    # min/step chosen so the default sits on the step grid (else browsers flag it invalid).
+    capital = b1.number_input("Capital to invest (₹)", 10_000.0, 1e10, 1_000_000.0, step=10_000.0,
                               key="pb_capital", format="%.0f")
     top_up = b1.checkbox("Spend leftover cash on the most under-weight names", value=True, key="pb_topup")
     alloc, left = portfolio.allocate(selected, float(capital), top_up=top_up)
@@ -641,8 +642,7 @@ def render_scan_tab() -> None:
     w1, w2 = st.columns([3, 2])
     with w1:
         st.subheader("Portfolio weights")
-        wchart = disp[["Symbol", "Weight"]].set_index("Symbol")
-        st.bar_chart(wchart, height=340, color=PAL["series"][0])
+        st.altair_chart(charts.weights_bar(disp[["Symbol", "Weight"]], PAL), width="stretch")
     with w2:
         st.subheader("Sector mix")
         if "Industry" in selected.columns:
@@ -967,7 +967,7 @@ def _render_sip(res: backtest.BacktestResult, bench_name: str) -> None:
     st.caption("A monthly SIP into the strategy (first trading day of each month) vs the same SIP into "
                "the benchmark. Assumes fractional units and no extra costs on the inflows.")
     c = st.columns(3)
-    amount = c[0].number_input("Monthly SIP (₹)", 500.0, 1e8, config.SIP_DEFAULT_AMOUNT, step=1_000.0,
+    amount = c[0].number_input("Monthly SIP (₹)", 500.0, 1e8, config.SIP_DEFAULT_AMOUNT, step=500.0,
                                key="sip_amt", format="%.0f")
     step_up = c[1].number_input("Annual step-up (%)", 0.0, 50.0, 0.0, step=5.0, key="sip_step",
                                 help="Raise the instalment by this % every 12 months (a 'step-up SIP').")
@@ -987,13 +987,14 @@ def _render_sip(res: backtest.BacktestResult, bench_name: str) -> None:
     if b is not None and b["n_instalments"]:
         k[3].metric(f"{bench_name} XIRR", _pct(b["xirr"]),
                     f"value {portfolio.round_lakh(b['final_value'])}", delta_color="off")
-    tl = pd.DataFrame({"Strategy": s["timeline"]["value"], "Invested": s["timeline"]["invested"]})
+    # Plotted in ₹ lakh (1 lakh = 1,00,000) — the unit Indian investors read SIP values in.
+    tl = pd.DataFrame({"Strategy": s["timeline"]["value"], "Invested": s["timeline"]["invested"]}) / 1e5
     colors = {"Strategy": PAL["series"][0]}
     if b is not None and b["n_instalments"]:
-        tl[bench_name] = b["timeline"]["value"]
+        tl[bench_name] = b["timeline"]["value"] / 1e5
         colors[bench_name] = PAL["series"][1]
     colors["Invested"] = PAL["muted"]
-    st.altair_chart(charts.line_chart(tl, colors, "₹", PAL, ",.0f", height=300, dashed=("Invested",)),
+    st.altair_chart(charts.line_chart(tl, colors, "₹ lakh", PAL, ",.1f", height=300, dashed=("Invested",)),
                     width="stretch")
 
 
@@ -1009,8 +1010,7 @@ def _render_attribution(res: backtest.BacktestResult) -> None:
                    "yield earned on uninvested cash, if any.")
         top = pd.concat([summ.head(10), summ.tail(10)]).drop_duplicates("Symbol")
         st.altair_chart(charts.diverging_bars(top, "Symbol", "contribution_inr", ",.1f",
-                                              f"Contribution (₹ on ₹{cap:,.0f})", PAL,
-                                              height=max(200, 22 * len(top))), width="stretch")
+                                              f"Contribution (₹ on ₹{cap:,.0f})", PAL), width="stretch")
         view = summ.assign(
             avg_weight=(summ["avg_weight"] * 100).round(2), win_rate=(summ["win_rate"] * 100).round(0),
             held_return=(summ["held_return"] * 100).round(1), best_period=(summ["best_period"] * 100).round(1),
@@ -1081,7 +1081,8 @@ def _render_holdings_trades(res: backtest.BacktestResult, bench_name: str) -> No
             if "score" in hd:
                 hd["score"] = hd["score"].round(3)
             st.dataframe(hd, hide_index=True, width="stretch", column_config={"weight": PCT_FMT})
-            st.bar_chart(h.set_index("Symbol")["weight"] * 100.0, height=280, color=PAL["series"][0])
+            st.altair_chart(charts.weights_bar(h.assign(Weight=h["weight"] * 100.0)[["Symbol", "Weight"]], PAL),
+                            width="stretch")
 
     # -- Index membership changes (entries / exits) ------------------------- #
     with st.expander("Index membership changes — scrips entering / leaving"):
@@ -1323,7 +1324,9 @@ def render_backtest_controls() -> dict:
         regime_on = g[0].checkbox(
             "Market-regime filter", value=False, key="bt_regime_on",
             help="At each rebalance, if the regime index closes below its moving average, cut exposure "
-            "(to cash by default). A classic trend filter that softens deep bear-market drawdowns.",
+            "(to cash by default). A classic trend filter that softens deep bear-market drawdowns. It is "
+            "only checked on rebalance dates, so with monthly or slower rebalancing a fast crash (e.g. "
+            "Feb–Mar 2020) can happen between checks — weekly makes the filter far more responsive.",
         )
         regime_ma = g[0].number_input("Moving average (days)", 20, 400, config.REGIME_MA_DAYS, step=10,
                                       key="bt_regime_ma", disabled=not regime_on)
