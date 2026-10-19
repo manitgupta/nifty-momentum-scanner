@@ -126,8 +126,8 @@ def _patched():
 def test_app_loads_tabs():
     at = AppTest.from_file(APP, default_timeout=60).run()
     check("load: no exception", not at.exception, str(at.exception))
-    check("load: two tabs", [t.label for t in at.tabs] == ["🔎 Scanner", "🧪 Backtest"],
-          str([t.label for t in at.tabs]))
+    top = [t.label for t in at.tabs][:3]
+    check("load: three top-level tabs", top == ["🔎 Scanner", "🧪 Backtest", "⚖️ Compare strategies"], str(top))
     check("load: backtest disclaimer shown",
           any("Backtest limitations" in w.value for w in at.warning))
     check("load: scan prompt shown",
@@ -319,10 +319,10 @@ def test_whole_index_universe_mode():
     with p1, p2, p3:
         at = AppTest.from_file(APP, default_timeout=120)
         at.run()
-        at.radio(key="uni_mode").set_value("Whole index").run()
+        at.radio(key="uni_mode").set_value("Index").run()
         check("whole-index: no exception after switch", not at.exception, str(at.exception))
-        check("whole-index: index selectbox appears",
-              any(s.label == "Index universe" for s in at.selectbox))
+        check("whole-index: index multiselect appears",
+              any(m.label == "Index universe" for m in at.multiselect))
         # A scan in whole-index mode should still work.
         at.button(key="run_scan").click().run()
         check("whole-index: scan runs", not at.exception and bool(ss(at, "scan")))

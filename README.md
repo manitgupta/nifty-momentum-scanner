@@ -1,12 +1,14 @@
 # Nifty500 Momentum 50 Scanner
 
-A utility that scans NSE-listed Indian stocks and applies the **Nifty500 Momentum 50**
-index construction rules (NSE *Methodology Document*, §20), with a lightweight
-Streamlit UI for configuring and running the scan.
+A utility that scans NSE-listed Indian stocks and ETFs and applies the **Nifty500 Momentum 50**
+index construction rules (NSE *Methodology Document*, §20), with a Streamlit UI for
+scanning, building an order list, backtesting and comparing strategy settings.
 
-It ranks a configurable universe (Largecap / Midcap / Small) by a
-**volatility-adjusted momentum score**, selects the top N, and computes
-free-float-cap × score portfolio weights with the methodology's 5% / 5× capping.
+It ranks a configurable universe — size segments, any NSE broad / sectoral / thematic
+index, a curated ETF basket or your own symbol list — by a **volatility-adjusted
+momentum score**, selects the top N, and weights them either by the methodology's
+free-float-cap × score with 5% / 5× capping, or by price-only schemes (score, equal,
+inverse-volatility).
 
 > ⚠️ **Educational tool, not investment advice.** It reproduces the *published
 > methodology* as faithfully as freely-available data allows — see
@@ -16,20 +18,18 @@ free-float-cap × score portfolio weights with the methodology's 5% / 5× cappin
 
 ## What it does
 
-1. **Builds the universe** from NSE index constituent lists. Choose either
-   composable **size segments** or a **whole index** in one pick:
+1. **Builds the universe.** Four sources, picked in the sidebar:
 
-   | Universe source | NSE index          | Size |
-   |-----------------|--------------------|------|
-   | Largecap        | Nifty 100          | 100  |
-   | Midcap          | Nifty Midcap 150   | 150  |
-   | Small           | Nifty Smallcap 250 | 250  |
-   | Nifty 500       | Nifty 500          | 500  |
-   | Nifty Total Market | Nifty Total Market | ~750 |
+   | Universe source | What you get |
+   |-----------------|--------------|
+   | **Size segments** | Largecap (Nifty 100) / Midcap (Midcap 150) / Small (Smallcap 250) — union ≈ Nifty 500 |
+   | **Index** (multi-select) | *Broad:* Nifty 50, Next 50, 100, 200, 500, Midcap 150/100, Smallcap 250/100, **Microcap 250**, LargeMidcap 250, MidSmallcap 400, **Total Market (~750)**. *Sectoral:* **Bank**, **Financial Services**, Private Bank, PSU Bank, IT, Pharma, Healthcare, Auto, FMCG, Metal, Realty, Energy, Oil & Gas, Media, Consumer Durables. *Thematic/strategy:* Infrastructure, India Consumption, CPSE, PSE, India Defence, Commodities, MNC, Services, Nifty200 Momentum 30, Nifty500 Momentum 50. Several indices combine (de-duplicated). |
+   | **ETFs** | A curated basket of 43 liquid NSE ETFs — one per underlying: broad equity, factor (momentum, alpha, low-vol, quality, value), sector, international (Nasdaq 100, FANG+, S&P 500 Top 50, Hang Seng), gold, silver, gilt and liquid. Pick any subset and add more symbols — a **custom ETF portfolio** for momentum rotation. |
+   | **Custom list** | Any NSE symbols you type (stocks and/or ETFs). Names/industries are filled from the bundled lists. |
 
-   The size segments' union ≈ the Nifty 500 (the index's base universe). The
-   **selected universe defines the eligible set** over which Z-scores are
-   normalized and the top N are chosen.
+   The **selected universe defines the eligible set** over which Z-scores are
+   normalized and the top N are chosen. Every NSE index list has a committed
+   fallback copy in `momentum/seed_data/` (NSE sometimes blocks cloud IPs).
 
 2. **Applies eligibility filters** (those computable from price/volume):
    minimum 1-year listing history, exclude bottom-10-percentile by 6-month
@@ -40,27 +40,63 @@ free-float-cap × score portfolio weights with the methodology's 5% / 5× cappin
    months, a *skip-month* toggle for "12-1"-style momentum, the volatility
    window, and the long/short Z-score weighting.
 
-4. **Selects & weights** the top N, capping each weight at `min(5%, 5×` its
-   free-float-mcap-only weight`)` and redistributing the excess.
+4. **Selects & weights** the top N — optionally with **at most N names per
+   sector** — using the methodology weighting (capping each weight at `min(5%, 5×`
+   its free-float-mcap-only weight`)` and redistributing the excess) or a
+   price-only scheme: **score**, **equal** or **inverse-volatility** (the default
+   for ETFs / custom lists, which have no market caps).
 
 Results are shown as a ranked, sortable table — including each stock's **actual
-closing price** on the as-of date — with a weights chart and CSV downloads (both
-the selection and the full audited universe).
+closing price** on the as-of date — with a weights chart, a sector-mix chart, a
+**market-regime banner** (is the matching index above its 200-day average?) and
+CSV downloads (both the selection and the full audited universe).
 
-The app has two tabs sharing one sidebar configuration:
+The app has three tabs sharing one sidebar configuration:
 
-- **🔎 Scanner** — the point-in-time scan described above.
-- **🧪 Backtest** — rebalances the strategy over a defined period (monthly /
-  quarterly / semi-annual / annual), on **multi-year history** (up to 15 years),
-  and compares it to a **benchmark** (Nifty 50 / Nifty 500). It reports an equity
-  curve (growth of ₹100), drawdown, and a full metrics panel — CAGR, annualised
+- **🔎 Scanner** — the point-in-time scan described above, plus a **portfolio
+  builder**: enter your capital to get whole-share quantities at the as-of closes
+  (leftover cash is topped up into the most under-weight names), or paste / upload
+  your **current holdings** to get the exact **sell and buy orders** for this
+  rebalance — with an optional rank buffer so positions still ranked inside, say,
+  the top 40 are kept rather than churned.
+- **🧪 Backtest** — rebalances the strategy over a defined period (**daily /
+  weekly / fortnightly / monthly / quarterly / semi-annual / annual**), on
+  multi-year history, and compares it to a **benchmark** — any of ~30 NSE indices
+  (Nifty 50, Next 50, 100, 200, 500, Midcap 150/100, **Smallcap 250**/100,
+  **Microcap 250**, Total Market, **Bank**, **Financial Services**, sector indices,
+  Nifty500 Momentum 50, …), Gold / Nasdaq-100 ETFs, an **Auto** option that matches
+  your universe, or a **universe equal-weight** benchmark (same stocks, same
+  survivorship bias — so the gap is the momentum selection's true value-add). NSE
+  benchmarks default to the **Total Return Index (TRI)**, the fair comparison for
+  a strategy valued on dividend-adjusted prices. It reports an equity curve
+  (growth of ₹100), drawdown, and a full metrics panel — CAGR, annualised
   volatility, Sharpe, Sortino, max drawdown (with peak/trough/recovery dates),
   Calmar, turnover, hit rate, and vs-benchmark beta / alpha / tracking error /
-  information ratio / up-down capture — plus per-rebalance period returns, the
-  rebalance schedule, a holdings viewer, and CSV exports. Optional per-side
-  trading-cost (bps) modelling is included.
+  information ratio / up-down capture.
 
-  The Backtest tab lets you:
+  **Risk controls:** a **rank buffer** (hold a name until it drops below rank X —
+  slashes turnover, especially for weekly/daily cadences), a **market-regime
+  filter** (cut exposure to cash or a chosen % when an index closes below its
+  N-day moving average; idle cash can earn a yield), a **sector cap**, and
+  **Indian cost presets** (statutory ≈ 11 bps/side, discount broker + slippage,
+  full-service, or custom).
+
+  **Report tabs:** *Overview* (KPIs, charts, metrics); *Returns analysis* — a
+  **calendar-returns heatmap** with annual returns vs the benchmark, **rolling
+  1/3/5-year returns** with % of windows positive / beating the benchmark, and the
+  **worst drawdown episodes**; *SIP* — a monthly (optionally step-up) **SIP
+  simulator with XIRR** vs the benchmark; *Attribution & sectors* — **per-stock
+  P&L contribution** (top winners/losers, win rate, return while held) and
+  **sector exposure over time**; *Holdings & trades* — period returns, schedule,
+  holdings, entries/exits and the transaction ledger; *Downloads* — CSVs and a
+  one-click **Excel report** with every table.
+- **⚖️ Compare strategies** — runs the Backtest tab's settings over a grid of
+  rebalance frequencies × Top N and shows a heatmap of the chosen metric
+  (Sharpe, CAGR, Calmar, max drawdown, …), a full metrics table and the top-5
+  equity curves. Scans are shared across the grid, so a 3×3 comparison costs
+  little more than one backtest.
+
+  The Backtest tab also lets you:
   - **Pick an exact date window** — choose the **start** and **end** dates to
     measure performance between any two specific dates (the first rebalance is
     auto-nudged later only if there isn't enough prior history for a scan).
@@ -139,9 +175,11 @@ rate-limit large (500-stock) scans — rerun, or start with a single segment.
 ## Run the tests
 
 ```bash
-./venv/bin/python tests/test_scanner.py    # scanner maths
-./venv/bin/python tests/test_backtest.py   # backtest engine
-./venv/bin/python tests/test_app.py        # Streamlit UI (headless AppTest, offline)
+./venv/bin/python tests/test_scanner.py       # scanner maths
+./venv/bin/python tests/test_backtest.py      # backtest engine
+./venv/bin/python tests/test_features.py      # analytics / portfolio / universe / benchmark sources
+./venv/bin/python tests/test_app.py           # Streamlit UI (headless AppTest, offline)
+./venv/bin/python tests/test_app_features.py  # Streamlit UI — new universes, risk controls, reports, Compare
 ```
 
 The tests are dependency-free (a tiny hand-rolled `check()` harness, no pytest) so
@@ -150,8 +188,9 @@ optional dev tool and run under it:
 
 ```bash
 ./venv/bin/python -m pip install -r requirements-dev.txt
-./venv/bin/python -m coverage run --branch --source=momentum.backtest,app tests/test_backtest.py
-./venv/bin/python -m coverage run --append --branch --source=momentum.backtest,app tests/test_app.py
+for t in scanner backtest features app app_features; do
+  ./venv/bin/python -m coverage run --append --branch --source=momentum,app tests/test_$t.py
+done
 ./venv/bin/python -m coverage report -m
 ```
 
@@ -167,6 +206,23 @@ optional dev tool and run under it:
   **membership churn** (entries/exits), trade-side classification, and the
   **transaction ledger** including a reconciliation that its rupee trades sum back
   to the engine's own turnover and cost.
+- **`test_scanner.py`** also checks the **vectorised** momentum maths against the
+  original per-ticker loop (an oracle) on messy data — gaps, late listings,
+  halts — plus sector caps, the rank buffer and the price-only weighting schemes.
+- **`test_backtest.py`** also covers daily / weekly / fortnightly schedules, the
+  regime filter (risk-off → cash, partial exposure, cash yield), the rank buffer
+  (lower turnover), sector caps, inverse-vol weights, the **per-stock attribution
+  reconciling exactly to the equity curve**, the parameter sweep matching
+  standalone runs, and **no look-ahead with every new feature switched on**.
+- **`test_features.py`** — calendar / rolling returns, drawdown episodes, XIRR & SIP
+  (closed forms), sector exposure, contribution summaries, the Excel export,
+  whole-share allocation, holdings parsing (text + broker CSV), rebalance orders,
+  symbol parsing / custom & ETF universes, and the benchmark **source ladder**
+  (NSE → bundled snapshot + Yahoo → Yahoo) with the network patched out.
+- **`test_app_features.py`** — headless UI runs of every new path: multi-index,
+  ETF and custom universes, the portfolio builder and rebalance orders, the new
+  cadences, risk controls, benchmark options (Auto / TRI / universe EW), every
+  report section, the Excel export and the Compare tab.
 - **`test_app.py`** — drives the Streamlit app headlessly with
   `streamlit.testing.v1.AppTest` and monkeypatched (offline) data: both tabs load,
   the Scanner still works, the Backtest runs and renders charts/metrics/tables, a
@@ -199,19 +255,34 @@ All parameters live in `momentum/config.py` and are overridable from the UI.
 
 ```
 nifty-momentum/
-├── app.py                 # Streamlit UI (Scanner + Backtest tabs)
+├── app.py                 # Streamlit UI (Scanner / Backtest / Compare tabs)
 ├── requirements.txt
 ├── momentum/
-│   ├── config.py          # methodology parameters + data-source config
-│   ├── universe.py        # NSE constituent lists -> eligible universe
-│   ├── data.py            # Yahoo Finance price/volume + market-cap + benchmark (disk-cached)
-│   ├── scanner.py         # eligibility, momentum, scoring, selection, weighting
-│   └── backtest.py        # rebalancing backtest engine + analytics (look-ahead-free)
-├── tests/
-│   ├── test_scanner.py    # scanner maths
-│   ├── test_backtest.py   # backtest engine
-│   └── test_app.py        # headless Streamlit UI (AppTest)
+│   ├── config.py          # methodology parameters, universe/benchmark registries, presets
+│   ├── universe.py        # NSE index lists, curated ETFs, custom symbol lists
+│   ├── data.py            # Yahoo prices/market caps + NSE (niftyindices) benchmarks, disk-cached
+│   ├── scanner.py         # eligibility, momentum (vectorised), scoring, selection, weighting
+│   ├── backtest.py        # rebalancing engine, regime/buffer/sector rules, sweeps (look-ahead-free)
+│   ├── analytics.py       # calendar/rolling returns, drawdowns, SIP/XIRR, attribution, Excel
+│   ├── portfolio.py       # whole-share allocation + rebalance order lists
+│   └── seed_data/         # offline fallbacks: index lists, etfs.csv, benchmarks.parquet
+├── scripts/
+│   └── refresh_seeds.py   # regenerate the seed constituent lists + benchmark snapshot
+├── tests/                 # dependency-free check() suites (see "Run the tests")
 └── data/                  # on-disk cache (gitignored)
+```
+
+### Refreshing the bundled data
+
+`momentum/seed_data/` holds offline fallbacks so the hosted app keeps working when
+NSE or niftyindices.com block cloud IPs: every index constituent list and a
+daily TRI + price snapshot of every NSE benchmark since 2005 (when the live
+source is unreachable the snapshot is chain-extended with Yahoo where a symbol
+exists). Refresh them occasionally:
+
+```bash
+./venv/bin/python scripts/refresh_seeds.py               # constituents + benchmark snapshot
+./venv/bin/python scripts/refresh_seeds.py --only bench  # just the benchmark snapshot
 ```
 
 ---
@@ -253,6 +324,18 @@ not precise — both are surfaced in the UI rather than hidden:
   therefore default to **price-only weighting** (score- or equal-weight); the
   5%/5× free-float capping is applied to live snapshots only.
 
+- **ETFs & custom lists** — ETFs have no market cap, so the methodology weighting
+  and the turnover-ratio filter don't apply; the app defaults to score weighting
+  and switches that filter off. Liquid-fund ETFs that pay daily dividends as units
+  show a flat price on Yahoo, so the basket uses a growth-option liquid ETF.
+- **Benchmarks** — NSE TRI/price indices come from niftyindices.com (back-calculated
+  before each index's launch date, e.g. Microcap 250 and the momentum indices).
+  The regime filter and the scanner banner use the price index.
+- **Daily / weekly rebalancing** — modelled at the close with the configured cost;
+  real-world slippage at that turnover can be much higher, so use realistic costs
+  and/or the rank buffer.
+
 Data sources: index constituents from NSE
-(`nsearchives.nseindia.com/content/indices/*.csv`) and prices/market caps from
-Yahoo Finance via [`yfinance`](https://github.com/ranaroussi/yfinance).
+(`nsearchives.nseindia.com/content/indices/*.csv`), benchmark TRI/price history
+from niftyindices.com, and prices/market caps from Yahoo Finance via
+[`yfinance`](https://github.com/ranaroussi/yfinance).

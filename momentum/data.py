@@ -188,40 +188,162 @@ def fetch_prices(
 # --------------------------------------------------------------------------- #
 # Benchmark index history (for backtest comparison)
 # --------------------------------------------------------------------------- #
-def fetch_benchmark(
-    ticker: str,
-    cache_key: str,
-    start: dt.date,
-    asof: dt.date,
-    force_refresh: bool = False,
-    cache_hours: float = config.HISTORY_CACHE_HOURS,
-) -> pd.Series:
-    """Return an adjusted daily close series for a benchmark index.
+BENCHMARK_SEED_PATH = config.SEED_DIR / "benchmarks.parquet"
 
-    ``ticker`` is a Yahoo index symbol (e.g. ``^NSEI``). Cached to ``data/`` like
-    the price frames. Returns an empty Series if Yahoo has nothing.
-    """
-    path = config.DATA_DIR / f"benchmark_{cache_key}.parquet"
-    if not force_refresh and _is_fresh(path, cache_hours):
-        return pd.read_parquet(path)["close"]
 
-    raw = yf.download(
-        ticker,
-        start=start.isoformat(),
-        end=(asof + dt.timedelta(days=1)).isoformat(),
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-    )
+def _empty_close() -> pd.Series:
+    return pd.Series(dtype="float64", name="close")
+
+
+def _yahoo_history(ticker: str, start: dt.date, asof: dt.date) -> pd.Series:
+    """Adjusted daily closes for one Yahoo symbol over ``[start, asof]`` (may be empty)."""
+    try:
+        raw = yf.download(
+            ticker,
+            start=start.isoformat(),
+            end=(asof + dt.timedelta(days=1)).isoformat(),
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception:
+        return _empty_close()
     if raw is None or raw.empty:
-        return pd.Series(dtype="float64", name="close")
-
+        return _empty_close()
     close = raw["Close"]
     if isinstance(close, pd.DataFrame):  # single ticker can still come back wide
         close = close.iloc[:, 0]
     close = close.dropna()
     close.name = "close"
-    close.to_frame().to_parquet(path)
+    return close
+
+
+def nse_index_history(
+    name: str, start: dt.date, end: dt.date, tri: bool = False, chunk_days: int = 365
+) -> pd.Series:
+    """Daily closes of an NSE index from niftyindices.com (full history since ~2005).
+
+    ``tri=True`` returns the Total Return Index (dividends reinvested) — the fair
+    comparison for a strategy valued on dividend-adjusted prices. The endpoint
+    wants a browser User-Agent and a JSON-string-inside-JSON payload; requests
+    are chunked to one year (the site's own UI limit) to stay polite.
+    Raises on network/HTTP errors; returns an empty Series for unknown names.
+    """
+    import json
+
+    import requests
+
+    path, dkey, vkey = (
+        ("getTotalReturnIndexString", "Date", "TotalReturnsIndex") if tri
+        else ("getHistoricaldatatabletoString", "HistoricalDate", "CLOSE")
+    )
+    headers = {"Content-Type": "application/json; charset=utf-8",
+               "User-Agent": config.HTTP_HEADERS["User-Agent"]}
+    rows: list[dict] = []
+    s, e_all = pd.Timestamp(start), pd.Timestamp(end)
+    while s <= e_all:
+        e = min(s + pd.Timedelta(days=chunk_days - 1), e_all)
+        cinfo = "{'name':'%s','startDate':'%s','endDate':'%s','indexName':'%s'}" % (
+            name, s.strftime("%d-%b-%Y"), e.strftime("%d-%b-%Y"), name)
+        r = requests.post(f"{config.NIFTYINDICES_URL}/{path}", data=json.dumps({"cinfo": cinfo}),
+                          headers=headers, timeout=config.HTTP_TIMEOUT)
+        r.raise_for_status()
+        rows += json.loads(r.text)
+        s = e + pd.Timedelta(days=1)
+    if not rows:
+        return _empty_close()
+    df = pd.DataFrame(rows)
+    if dkey not in df.columns or vkey not in df.columns:
+        raise ValueError(f"Unexpected niftyindices response format: {list(df.columns)[:6]}")
+    out = pd.Series(pd.to_numeric(df[vkey], errors="coerce").values,
+                    index=pd.to_datetime(df[dkey], format="%d %b %Y"), name="close")
+    out = out[~out.index.duplicated()].sort_index().dropna()
+    return out[out > 0]
+
+
+def _seed_benchmark(nse_name: str | None, tri: bool) -> pd.Series:
+    """Bundled snapshot of an NSE index (TRI or price) — the offline fallback."""
+    if not nse_name or not BENCHMARK_SEED_PATH.exists():
+        return _empty_close()
+    col = f"{nse_name}|{'TRI' if tri else 'PRICE'}"
+    try:
+        seed = pd.read_parquet(BENCHMARK_SEED_PATH, columns=[col])[col].dropna()
+    except Exception:
+        return _empty_close()
+    seed.name = "close"
+    return seed
+
+
+def _chain_extend(base: pd.Series, ext: pd.Series) -> pd.Series:
+    """Append ``ext``'s returns after ``base``'s last date (chain-linked levels)."""
+    if base.empty:
+        return ext
+    if ext.empty:
+        return base
+    last = base.index[-1]
+    anchor = ext[ext.index <= last]
+    after = ext[ext.index > last]
+    if anchor.empty or after.empty:
+        return base
+    scaled = after / float(anchor.iloc[-1]) * float(base.iloc[-1])
+    out = pd.concat([base, scaled])
+    out.name = "close"
+    return out
+
+
+def fetch_benchmark(
+    ticker: str | None,
+    cache_key: str,
+    start: dt.date,
+    asof: dt.date,
+    force_refresh: bool = False,
+    cache_hours: float = config.HISTORY_CACHE_HOURS,
+    nse_name: str | None = None,
+    tri: bool = False,
+) -> pd.Series:
+    """Return a daily close series for a benchmark, best source first.
+
+    1. ``nse_name`` → niftyindices.com (TRI if ``tri``, else price index);
+    2. otherwise / on failure → the bundled snapshot of that index, chain-extended
+       with Yahoo ``ticker`` returns for days after the snapshot;
+    3. ``ticker`` alone → Yahoo (adjusted close; a *price* index for indices).
+
+    The chosen source is recorded in ``series.attrs["source"]``. Cached to
+    ``data/``. Returns an empty Series when nothing is available.
+    """
+    path = config.DATA_DIR / f"benchmark_{cache_key}.parquet"
+    if not force_refresh and _is_fresh(path, cache_hours):
+        cached = pd.read_parquet(path)
+        out = cached["close"]
+        out.attrs["source"] = str(cached["source"].iloc[0]) if "source" in cached and len(cached) else ""
+        return out
+
+    kind = "TRI" if tri else "price"
+    close, source = _empty_close(), ""
+    if nse_name:
+        try:
+            close = nse_index_history(nse_name, start, asof, tri=tri)
+            source = f"NSE {kind} index"
+        except Exception:
+            close = _empty_close()
+        if close.empty:
+            seed = _seed_benchmark(nse_name, tri)
+            if not seed.empty:
+                yahoo = _yahoo_history(ticker, seed.index[-1].date() - dt.timedelta(days=10), asof) if ticker else _empty_close()
+                close = _chain_extend(seed, yahoo)
+                source = f"NSE {kind} index (bundled snapshot to {seed.index[-1].date()})"
+                if len(close) > len(seed):
+                    source += " + Yahoo price thereafter"
+    if close.empty and ticker:
+        close = _yahoo_history(ticker, start, asof)
+        source = "Yahoo price index" if (nse_name or ticker.startswith("^")) else "Yahoo (adjusted close)"
+    if close.empty:
+        return _empty_close()
+
+    close = close[(close.index >= pd.Timestamp(start)) & (close.index <= pd.Timestamp(asof))]
+    close.name = "close"
+    close.to_frame().assign(source=source).to_parquet(path)
+    close.attrs["source"] = source
     return close
 
 

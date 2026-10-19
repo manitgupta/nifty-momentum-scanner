@@ -1,0 +1,44 @@
+Company Name,Industry,Symbol,Series,ISIN Code
+Nifty 50 ETF,Equity · Large cap,NIFTYBEES,EQ,INF204KB14I2
+Nifty Next 50 ETF,Equity · Large cap,JUNIORBEES,EQ,INF732E01045
+Nifty 100 ETF,Equity · Large cap,NIF100BEES,EQ,INF204K014N5
+Nifty 500 ETF,Equity · Broad market,MONIFTY500,EQ,INF247L01BU1
+Nifty Midcap 150 ETF,Equity · Mid cap,MID150BEES,EQ,INF204KB1V68
+Nifty Midcap 100 ETF,Equity · Mid cap,MOM100,EQ,INF247L01023
+Nifty Smallcap 250 ETF,Equity · Small cap,HDFCSML250,EQ,INF179KC1FB2
+Nifty Alpha 50 ETF,Equity · Factor,ALPHA,EQ,INF174KA1IA5
+Nifty200 Momentum 30 ETF,Equity · Factor,MOM30IETF,EQ,INF109KC17C7
+Nifty500 Momentum 50 ETF,Equity · Factor,MOMENTUM50,EQ,INF247L01DK8
+Nifty100 Low Volatility 30 ETF,Equity · Factor,LOWVOLIETF,EQ,INF109KC19U5
+Nifty Alpha Low-Volatility 30 ETF,Equity · Factor,ALPL30IETF,EQ,INF109KC17V7
+Nifty200 Quality 30 ETF,Equity · Factor,QUAL30IETF,EQ,INF109KC18V5
+Nifty50 Value 20 ETF,Equity · Factor,NV20IETF,EQ,INF109KC11V0
+Nifty Dividend Opportunities 50 ETF,Equity · Factor,DIVOPPBEES,EQ,INF204KA1MS3
+Nifty Bank ETF,Equity · Sector,BANKBEES,EQ,INF204KB15I9
+Nifty PSU Bank ETF,Equity · Sector,PSUBNKBEES,EQ,INF204KB16I7
+Nifty Private Bank ETF,Equity · Sector,PVTBANIETF,EQ,INF109KC18U7
+Nifty Financial Services ETF,Equity · Sector,BFSI,EQ,INF769K01HI8
+Nifty IT ETF,Equity · Sector,ITBEES,EQ,INF204KB15V2
+Nifty Pharma ETF,Equity · Sector,PHARMABEES,EQ,INF204KC1089
+Nifty Healthcare ETF,Equity · Sector,HEALTHIETF,EQ,INF109KC1Q72
+Nifty Auto ETF,Equity · Sector,AUTOBEES,EQ,INF204KC1337
+Nifty FMCG ETF,Equity · Sector,FMCGIETF,EQ,INF109KC19V3
+Nifty Metal ETF,Equity · Sector,METALIETF,EQ,INF109KC19W1
+Nifty Realty ETF,Equity · Sector,MOREALTY,EQ,INF247L01CI4
+Nifty Oil & Gas ETF,Equity · Sector,OILIETF,EQ,INF109KC18W3
+Nifty Infrastructure ETF,Equity · Thematic,INFRAIETF,EQ,INF109KC16E5
+Nifty CPSE ETF,Equity · Thematic,CPSEETF,EQ,INF457M01133
+BSE Bharat 22 (PSU) ETF,Equity · Thematic,ICICIB22,EQ,INF109KB15Y7
+Nifty India Consumption ETF,Equity · Thematic,CONSUMBEES,EQ,INF204KA1LD7
+Nifty India Defence ETF,Equity · Thematic,MODEFENCE,EQ,INF247L01DJ0
+Nifty Commodities ETF,Equity · Thematic,COMMOIETF,EQ,INF109KC19O8
+Nifty India Manufacturing ETF,Equity · Thematic,MAKEINDIA,EQ,INF769K01IB1
+Nasdaq 100 (US) ETF,International,MON100,EQ,INF247L01AP3
+NYSE FANG+ (US) ETF,International,MAFANG,EQ,INF769K01HF4
+S&P 500 Top 50 (US) ETF,International,MASPTOP50,EQ,INF769K01HP3
+Hang Seng (HK) ETF,International,HNGSNGBEES,EQ,INF204KB19I1
+Gold ETF,Commodity,GOLDBEES,EQ,INF204KB17I5
+Silver ETF,Commodity,SILVERBEES,EQ,INF204KC1402
+Nifty 8-13yr G-Sec ETF,Debt,LTGILTBEES,EQ,INF204KB1882
+Nifty 5yr Benchmark G-Sec ETF,Debt,GILT5YBEES,EQ,INF204KC1030
+Nifty 1D Rate (liquid) ETF,Debt,LIQUIDCASE,EQ,INF0R8F01034

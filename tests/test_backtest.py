@@ -694,7 +694,215 @@ def test_membership_captures_real_churn():
 
 
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Phase 5: cadences, rank buffer, regime filter, sector cap, attribution, sweep
+# --------------------------------------------------------------------------- #
+def _wide_prices(n=12, years=5, seed=3):
+    """n noisy tickers across 4 industries (so rankings churn and caps bind)."""
+    rng = np.random.default_rng(seed)
+    end = dt.date(2026, 6, 30)
+    idx = pd.bdate_range(end=pd.Timestamp(end), periods=int(years * 252))
+    cols = [f"N{i:02d}.NS" for i in range(n)]
+    close = pd.DataFrame(100 * np.exp(np.cumsum(rng.normal(0.0004, 0.018, (len(idx), n)), axis=0)),
+                         index=idx, columns=cols)
+    vol = pd.DataFrame(1_000_000, index=idx, columns=cols)
+    market = pd.DataFrame({"market_cap": 5e11, "shares": 1e9, "last_price": 1.0}, index=cols)
+    pdata = PriceData(close=close, raw_close=close.copy(), volume=vol, market=market, failed=[])
+    inds = ["Bank", "IT", "Pharma", "Auto"]
+    uni = pd.DataFrame({"Symbol": [c[:-3] for c in cols], "Company": cols,
+                        "Industry": [inds[i % 4] for i in range(n)], "Segment": "L", "YFTicker": cols})
+    return pdata, uni, idx
+
+
+def test_cadences_schedule_and_rpy():
+    idx = pd.bdate_range("2024-01-01", "2024-12-31")
+    d = backtest.generate_schedule(idx, dt.date(2024, 3, 2), dt.date(2024, 3, 29), 1, unit="days")
+    check("daily: every trading day from the snapped start", list(d["trading_date"]) ==
+          list(idx[(idx >= pd.Timestamp("2024-03-01")) & (idx <= pd.Timestamp("2024-03-29"))]))
+    check("daily: no snapping rows unused", bool(d["used"].all()))
+    w = backtest.generate_schedule(idx, dt.date(2024, 1, 3), dt.date(2024, 3, 31), 1, unit="weeks")
+    used = w[w["used"]]["trading_date"]
+    check("weekly: 7-day spacing (13 dates in Q1 from Jan 3)", len(used) == 13 and
+          bool((used.diff().dropna() == pd.Timedelta(days=7)).all()), str(len(used)))
+    f = backtest.generate_schedule(idx, dt.date(2024, 1, 3), dt.date(2024, 3, 31), 2, unit="weeks")
+    check("fortnightly: 14-day spacing", bool((f[f["used"]]["trading_date"].diff().dropna() == pd.Timedelta(days=14)).all()))
+    check("rpy: daily = trading days", backtest.rebalances_per_year("days", 1, 252) == 252)
+    check("rpy: weekly 52, fortnightly 26, quarterly 4",
+          backtest.rebalances_per_year("weeks", 1) == 52 and backtest.rebalances_per_year("weeks", 2) == 26
+          and backtest.rebalances_per_year("months", 3) == 4)
+    pdata, uni, _ = _wide_prices()
+    p = _params(pdata, freq=3)
+    check("freq_spec: legacy months", backtest.freq_spec(p) == ("months", 3))
+    check("freq_spec: named override", backtest.freq_spec(replace(p, rebalance_freq="Weekly")) == ("weeks", 1))
+    try:
+        backtest.freq_spec(replace(p, rebalance_freq="Hourly"))
+        check("freq_spec: unknown name rejected", False)
+    except ValueError:
+        check("freq_spec: unknown name rejected", True)
+
+
+def test_daily_weekly_backtests_run():
+    pdata, uni, idx = _wide_prices(years=3)
+    start = (idx[0] + pd.Timedelta(days=420)).date()
+    for f, lo in (("Daily", 300), ("Weekly", 60), ("Fortnightly", 30)):
+        p = replace(_params(pdata, start=start, top_n=4), rebalance_freq=f, cost_bps=10.0)
+        r = backtest.run_backtest(uni, pdata, p)
+        check(f"{f}: ran with many rebalances", len(r.rebalance_dates) >= lo, str(len(r.rebalance_dates)))
+        eq = r.equity_curve
+        ok = True
+        for _, row in r.period_returns.iterrows():
+            t0 = eq.index[eq.index <= row["period_start"]][-1]
+            if not math.isclose(eq.loc[row["period_end"]] / eq.loc[t0] - 1.0, row["strat_ret"], rel_tol=1e-7, abs_tol=1e-9):
+                ok = False
+                break
+        check(f"{f}: period ratio identity holds", ok)
+    rm = backtest.run_backtest(uni, pdata, replace(_params(pdata, start=start, top_n=4), rebalance_freq="Monthly"))
+    rw = backtest.run_backtest(uni, pdata, replace(_params(pdata, start=start, top_n=4), rebalance_freq="Weekly"))
+    check("weekly trades more than monthly (annual turnover)",
+          rw.metrics["annual_turnover"] > rm.metrics["annual_turnover"])
+
+
+def test_hold_period_cash_sleeve():
+    idx = pd.bdate_range("2022-01-03", periods=11)
+    close = pd.DataFrame({"A.NS": np.linspace(100, 110, 11)}, index=idx)
+    w = pd.Series({"A.NS": 0.5})
+    daily = 0.001
+    path, w_end = backtest._hold_period_path(close, w, idx[0], idx[-1], cash=0.5, cash_daily=daily)
+    exp_end = 0.5 * 110 / 100 + 0.5 * (1 + daily) ** 10
+    check("cash-sleeve: end value = risky + compounded cash", math.isclose(path.iloc[-1], exp_end, rel_tol=1e-12))
+    check("cash-sleeve: drifted risky weight excludes cash",
+          math.isclose(w_end["A.NS"], 0.55 / exp_end, rel_tol=1e-12))
+
+
+def test_regime_states_and_filter():
+    idx = pd.bdate_range("2020-01-01", periods=600)
+    up = pd.Series(np.linspace(100, 200, 600), index=idx)
+    st_up = backtest.regime_states(up, [idx[100], idx[300], idx[599]], 200)
+    check("regime: insufficient history -> None", st_up[idx[100]] is None)
+    check("regime: rising index -> risk-on", st_up[idx[300]] is True and st_up[idx[599]] is True)
+    down = pd.Series(np.r_[np.linspace(100, 200, 300), np.linspace(200, 120, 300)], index=idx)
+    st_dn = backtest.regime_states(down, [idx[599]], 200)
+    check("regime: falling below SMA -> risk-off", st_dn[idx[599]] is False)
+    check("regime: no series -> all None", all(v is None for v in backtest.regime_states(None, [idx[0]]).values()))
+
+    pdata, uni, idx2 = _wide_prices(years=5)
+    n = len(idx2)
+    t = np.arange(n)
+    bench = pd.Series(np.where(t < n * 0.55, 100 * np.exp(0.0006 * t), 100 * np.exp(0.0006 * n * 0.55 - 0.0009 * (t - n * 0.55))),
+                      index=idx2)
+    base = replace(_params(pdata, top_n=4, cost_bps=0.0), rebalance_freq="Monthly")
+    on = backtest.run_backtest(uni, pdata, replace(base, regime_filter=True, cash_yield_annual=0.0), benchmark_series=bench)
+    pr = on.period_returns
+    off_rows = pr[pr["risk_on"] == False]  # noqa: E712
+    check("regime-bt: some rebalances go to cash", len(off_rows) > 0 and bool(off_rows["empty"].all()))
+    check("regime-bt: cash periods are flat (0% yield)", bool(np.allclose(off_rows["strat_ret"], 0.0, atol=1e-12)))
+    check("regime-bt: time-in-market < 1", on.metrics["time_in_market"] < 1.0)
+    check("regime-bt: note explains risk-off count", any("risk-off at" in nt for nt in on.notes))
+    y = backtest.run_backtest(uni, pdata, replace(base, regime_filter=True, cash_yield_annual=0.06), benchmark_series=bench)
+    ry = y.period_returns[y.period_returns["risk_on"] == False]  # noqa: E712
+    check("regime-bt: cash yield accrues in risk-off periods", bool((ry["strat_ret"] > 0).all()))
+    half = backtest.run_backtest(uni, pdata, replace(base, regime_filter=True, regime_exposure_off=0.5), benchmark_series=bench)
+    hp = half.period_returns[half.period_returns["risk_on"] == False]  # noqa: E712
+    check("regime-bt: partial exposure 50% when risk-off", bool(np.allclose(hp["exposure"], 0.5)))
+    sep = backtest.run_backtest(uni, pdata, replace(base, regime_filter=True), benchmark_series=None, regime_series=bench)
+    check("regime-bt: separate regime series works without a benchmark",
+          bool((sep.period_returns["risk_on"] == False).any()) and sep.benchmark_curve is None)  # noqa: E712
+
+
+def test_rank_buffer_reduces_turnover():
+    pdata, uni, _ = _wide_prices(years=5, seed=11)
+    base = replace(_params(pdata, top_n=3, cost_bps=0.0), rebalance_freq="Monthly")
+    plain = backtest.run_backtest(uni, pdata, base)
+    buf = backtest.run_backtest(uni, pdata, replace(base, exit_rank=6))
+    check("buffer: lowers annual turnover", buf.metrics["annual_turnover"] < plain.metrics["annual_turnover"],
+          f"{buf.metrics['annual_turnover']:.3f} vs {plain.metrics['annual_turnover']:.3f}")
+    check("buffer: still at most top_n names", all(len(h) <= 3 for h in buf.holdings.values()))
+    check("buffer: note recorded", any("Rank buffer" in nt for nt in buf.notes))
+
+
+def test_sector_cap_and_inverse_vol():
+    pdata, uni, _ = _wide_prices(years=4)
+    base = replace(_params(pdata, top_n=6), rebalance_freq="Quarterly")
+    capped = backtest.run_backtest(uni, pdata, replace(base, scan_params=replace(base.scan_params, max_per_sector=1)))
+    check("sector-cap: ≤1 name per industry every rebalance",
+          all(h["Industry"].value_counts().max() <= 1 for h in capped.holdings.values()))
+    check("sector-cap: holdings shrink to #industries (4)", all(len(h) <= 4 for h in capped.holdings.values()))
+    iv = backtest.run_backtest(uni, pdata, replace(base, weighting="inverse_vol"))
+    d0 = iv.rebalance_dates[0]
+    h = iv.holdings[d0]
+    check("inverse-vol: weights sum to 1", math.isclose(h["weight"].sum(), 1.0, rel_tol=1e-9))
+    check("inverse-vol: weights differ from equal", h["weight"].std() > 1e-6)
+
+
+def test_contributions_reconcile():
+    pdata, uni, _ = _wide_prices(years=4)
+    p = replace(_params(pdata, top_n=4, cost_bps=25.0), rebalance_freq="Monthly")
+    r = backtest.run_backtest(uni, pdata, p)
+    c = r.contributions
+    check("contrib: one row per held name per period",
+          len(c) == int(r.period_returns["n_holdings"].sum()))
+    cost_units = r.transactions["cost"].sum() / p.initial_capital
+    gain = float(r.equity_curve.iloc[-1] - 1.0)
+    check("contrib: Σ contributions − costs == equity gain",
+          math.isclose(c["contribution"].sum() - cost_units, gain, rel_tol=1e-9, abs_tol=1e-12),
+          f"{c['contribution'].sum() - cost_units} vs {gain}")
+    check("contrib: ₹ column = units × capital",
+          np.allclose(c["contribution_inr"], c["contribution"] * p.initial_capital))
+
+
+def test_universe_equal_weight():
+    idx = pd.bdate_range("2024-01-01", periods=4)
+    close = pd.DataFrame({"A": [100, 110, 121, 121], "B": [50, 50, np.nan, 55]}, index=idx, dtype=float)
+    ew = backtest.universe_equal_weight(close)
+    exp = [1.0, 1.05, 1.05 * 1.10, 1.05 * 1.10 * 1.0]  # day3: only A trades (+10%); day4: A 0%, B NaN prev → skip
+    check("ew: daily average of available names", np.allclose(ew.values, exp), str(ew.values))
+    check("ew: empty -> empty", backtest.universe_equal_weight(pd.DataFrame()).empty)
+
+
+def test_sweep_matches_individual_runs():
+    pdata, uni, _ = _wide_prices(years=4)
+    base = replace(_params(pdata, top_n=4, cost_bps=10.0), exit_rank=8)
+    table, curves = backtest.run_sweep(uni, pdata, base, [2, 4], ["Monthly", "Quarterly"])
+    check("sweep: 4 rows / 4 curves", len(table) == 4 and len(curves) == 4)
+    single = backtest.run_backtest(uni, pdata, replace(base, rebalance_freq="Quarterly",
+                                                       scan_params=replace(base.scan_params, top_n=2), exit_rank=4))
+    row = table[(table["frequency"] == "Quarterly") & (table["top_n"] == 2)].iloc[0]
+    check("sweep: cached-scan result == standalone run (CAGR)", math.isclose(row["cagr"], single.metrics["cagr"], rel_tol=1e-12))
+    check("sweep: equity curve identical", curves["Quarterly · Top 2"].equals(single.equity_curve))
+
+
+def test_no_lookahead_with_new_features():
+    """Weekly cadence + buffer + sector cap + regime must remain look-ahead-free."""
+    pdata, uni, idx, cut = _reordering_prices(years=6)
+    uni = uni.assign(Industry=["A", "A", "B", "B", "C", "C"])
+    bench = pd.Series(np.linspace(100, 300, len(idx)), index=idx)
+    sp = ScanParams(asof=idx[-1].date(), top_n=3, apply_listing_filter=False, apply_liquidity_filter=False,
+                    apply_turnover_ratio_filter=False, max_per_sector=2)
+    start = (idx[0] + pd.Timedelta(days=420)).date()
+    p_full = backtest.BacktestParams(scan_params=sp, start=start, end=idx[-1].date(), rebalance_freq="Weekly",
+                                     exit_rank=4, regime_filter=True, regime_ma_days=100)
+    p_trunc = replace(p_full, end=cut.date())
+    r_full = backtest.run_backtest(uni, pdata, p_full, benchmark_series=bench)
+    r_trunc = backtest.run_backtest(uni, _slice_pdata(pdata, cut), p_trunc, benchmark_series=bench.loc[:cut])
+    shared = [d for d in r_trunc.holdings if d in r_full.holdings]
+    same = all(list(r_full.holdings[d].index) == list(r_trunc.holdings[d].index)
+               and np.allclose(r_full.holdings[d]["weight"], r_trunc.holdings[d]["weight"], atol=1e-12)
+               for d in shared)
+    check("no-lookahead+: holdings identical pre-cutoff (weekly, buffer, cap, regime)", same and len(shared) > 20,
+          f"shared={len(shared)}")
+
+
 if __name__ == "__main__":
+    test_cadences_schedule_and_rpy()
+    test_daily_weekly_backtests_run()
+    test_hold_period_cash_sleeve()
+    test_regime_states_and_filter()
+    test_rank_buffer_reduces_turnover()
+    test_sector_cap_and_inverse_vol()
+    test_contributions_reconcile()
+    test_universe_equal_weight()
+    test_sweep_matches_individual_runs()
+    test_no_lookahead_with_new_features()
     test_generate_schedule()
     test_target_weights()
     test_turnover_and_cost()

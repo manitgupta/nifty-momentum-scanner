@@ -55,6 +55,13 @@ class ScanParams:
     cap_absolute: float = config.CAP_ABSOLUTE
     cap_relative: float = config.CAP_RELATIVE
     free_float_factor: float = 1.0  # ff-mcap approx = full mcap * factor (see README)
+    # "mcap_score" = methodology (free-float mcap x score, 5%/5x capped); the others
+    # ("score", "equal", "inverse_vol") are price-only and uncapped — needed for
+    # universes without market caps (ETFs) and identical to the backtest schemes.
+    weighting: str = "mcap_score"
+    # Diversification: at most this many names per Industry in the selection
+    # (None/0 = no cap). Applied while walking down the ranking.
+    max_per_sector: int | None = None
 
 
 @dataclass
@@ -76,12 +83,39 @@ def _asof_price(series: pd.Series, when: dt.date) -> float:
     return float(s.iloc[-1]) if len(s) else np.nan
 
 
+def _row_pos(index: pd.DatetimeIndex, when) -> int:
+    """Position of the last index entry on/before ``when`` (-1 if none). Index must be sorted."""
+    return int(index.searchsorted(pd.Timestamp(when), side="right")) - 1
+
+
+def _last_valid(values: np.ndarray, valid: np.ndarray, pos: int) -> np.ndarray:
+    """Per-column last non-NaN value within rows ``[0, pos]`` (NaN where none).
+
+    Vectorised equivalent of ``frame.iloc[:pos+1].ffill().iloc[-1]`` — it only
+    ever reads rows at or before ``pos``, so it cannot look ahead.
+    """
+    n = values.shape[1]
+    if pos < 0 or n == 0:
+        return np.full(n, np.nan)
+    rev = valid[pos::-1]                       # rows pos, pos-1, …, 0
+    has = rev.any(axis=0)
+    rows = pos - rev.argmax(axis=0)            # first True in reverse = last valid
+    out = values[rows, np.arange(n)]
+    return np.where(has, out, np.nan)
+
+
+def _sorted(frame: pd.DataFrame) -> pd.DataFrame:
+    return frame if frame.index.is_monotonic_increasing else frame.sort_index()
+
+
 def _asof_closes(frame: pd.DataFrame, when: dt.date) -> pd.Series:
     """Per-column last valid close on or before ``when``; empty frame -> empty Series."""
     if frame is None or frame.empty:
         return pd.Series(dtype="float64")
-    s = frame[frame.index <= pd.Timestamp(when)]
-    return s.ffill().iloc[-1] if len(s) else pd.Series(np.nan, index=frame.columns)
+    frame = _sorted(frame)
+    vals = frame.to_numpy(dtype="float64")
+    out = _last_valid(vals, ~np.isnan(vals), _row_pos(frame.index, when))
+    return pd.Series(out, index=frame.columns)
 
 
 # --------------------------------------------------------------------------- #
@@ -104,45 +138,57 @@ def compute_momentum(close: pd.DataFrame, params: ScanParams) -> pd.DataFrame:
     date_12m = asof - relativedelta(months=params.lookback_long_months)
     vol_start = asof - relativedelta(months=params.vol_lookback_months)
 
-    rows = []
-    for ticker in close.columns:
-        series = close[ticker].dropna()
-        if series.empty:
-            continue
+    cols = ["ret_6m", "ret_12m", "sigma", "mr_6", "mr_12", "n_obs", "first_date", "last_date"]
+    if close is None or close.empty:
+        return pd.DataFrame(columns=cols, index=pd.Index([], name="YFTicker"))
 
-        p0 = _asof_price(series, end)
-        p6 = _asof_price(series, date_6m)
-        p12 = _asof_price(series, date_12m)
+    # Vectorised across tickers (one numpy pass per as-of instead of a per-ticker
+    # loop) — this is what makes daily/weekly backtests (thousands of scans) fast.
+    close = _sorted(close.loc[:, close.notna().any()])   # skip never-traded tickers
+    idx = close.index
+    vals = close.to_numpy(dtype="float64")
+    valid = ~np.isnan(vals)
 
-        ret_6m = p0 / p6 - 1.0 if (p6 and not np.isnan(p6)) else np.nan
-        ret_12m = p0 / p12 - 1.0 if (p12 and not np.isnan(p12)) else np.nan
+    p0 = _last_valid(vals, valid, _row_pos(idx, end))
+    p6 = _last_valid(vals, valid, _row_pos(idx, date_6m))
+    p12 = _last_valid(vals, valid, _row_pos(idx, date_12m))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ret_6m = np.where(~np.isnan(p6) & (p6 != 0), p0 / p6 - 1.0, np.nan)
+        ret_12m = np.where(~np.isnan(p12) & (p12 != 0), p0 / p12 - 1.0, np.nan)
 
-        # Annualised std-dev of lognormal daily returns over the trailing window.
-        window = series[(series.index > pd.Timestamp(vol_start)) & (series.index <= pd.Timestamp(asof))]
-        log_ret = np.log(window / window.shift(1)).dropna()
-        if len(log_ret) >= 2:
-            sigma = float(log_ret.std(ddof=params.vol_ddof) * np.sqrt(params.trading_days))
-        else:
-            sigma = np.nan
+    # Annualised std-dev of lognormal daily returns over (vol_start, asof]. Each
+    # return is taken between consecutive *valid* closes inside the window (gaps
+    # are bridged, the first in-window close has no return) — as the per-series
+    # ``dropna()`` + ``shift(1)`` formulation did.
+    hi = _row_pos(idx, asof)
+    lo = int(idx.searchsorted(pd.Timestamp(vol_start), side="right"))
+    block = close.iloc[lo:hi + 1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_ret = np.log(block / block.ffill().shift(1))
+    n_ret = log_ret.notna().sum(axis=0).to_numpy()
+    sigma = log_ret.std(ddof=params.vol_ddof).to_numpy() * np.sqrt(params.trading_days)
+    sigma = np.where(n_ret >= 2, sigma, np.nan)
 
-        mr_6 = ret_6m / sigma if sigma and not np.isnan(sigma) and sigma > 0 else np.nan
-        mr_12 = ret_12m / sigma if sigma and not np.isnan(sigma) and sigma > 0 else np.nan
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pos_sigma = ~np.isnan(sigma) & (sigma > 0)
+        mr_6 = np.where(pos_sigma, ret_6m / sigma, np.nan)
+        mr_12 = np.where(pos_sigma, ret_12m / sigma, np.nan)
 
-        rows.append(
-            {
-                "YFTicker": ticker,
-                "ret_6m": ret_6m,
-                "ret_12m": ret_12m,
-                "sigma": sigma,
-                "mr_6": mr_6,
-                "mr_12": mr_12,
-                "n_obs": int(series[series.index <= pd.Timestamp(asof)].shape[0]),
-                "first_date": series.index.min(),
-                "last_date": series.index.max(),
-            }
-        )
-
-    return pd.DataFrame(rows).set_index("YFTicker")
+    n = len(idx)
+    out = pd.DataFrame(
+        {
+            "ret_6m": ret_6m,
+            "ret_12m": ret_12m,
+            "sigma": sigma,
+            "mr_6": mr_6,
+            "mr_12": mr_12,
+            "n_obs": valid[: hi + 1].sum(axis=0).astype(int) if hi >= 0 else np.zeros(vals.shape[1], int),
+            "first_date": idx[valid.argmax(axis=0)],
+            "last_date": idx[n - 1 - valid[::-1].argmax(axis=0)],
+        },
+        index=pd.Index(close.columns, name="YFTicker"),
+    )
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -305,16 +351,105 @@ def _iterative_cap(raw: pd.Series, cap: pd.Series, max_iter: int) -> pd.Series:
     return w
 
 
-def select_and_weight(df: pd.DataFrame, params: ScanParams) -> pd.DataFrame:
-    """Take the top-N eligible stocks and assign capped weights.
+WEIGHTING_SCHEMES = ("mcap_score", "score", "equal", "inverse_vol")
 
-    raw weight  = free-float mcap x Normalized Momentum Score
-    cap_i       = min(cap_absolute, cap_relative x free-float-mcap-only weight_i)
+
+def select_top(
+    ranked: pd.DataFrame,
+    top_n: int,
+    max_per_sector: int | None = None,
+    keep=None,
+    exit_rank: int | None = None,
+) -> list:
+    """Choose up to ``top_n`` names from a scored frame, best score first.
+
+    ``max_per_sector`` caps how many names may come from one ``Industry`` (names
+    over the cap are skipped and the walk continues down the ranking).
+
+    ``keep`` + ``exit_rank`` implement a *rank buffer* (hysteresis): currently
+    held names that still rank within ``exit_rank`` are retained first, and only
+    the remaining slots are filled by the best-ranked newcomers. This is how real
+    momentum indices damp turnover. Returns tickers in rank order.
+    """
+    if ranked is None or ranked.empty or top_n <= 0:
+        return []
+    order = ranked.sort_values("score", ascending=False, kind="mergesort")
+    tickers = list(order.index)
+    rank = {t: i + 1 for i, t in enumerate(tickers)}
+    use_cap = bool(max_per_sector) and "Industry" in order.columns
+    industry = order["Industry"].fillna("—").to_dict() if use_cap else {}
+    counts: dict = {}
+    chosen: list = []
+    chosen_set: set = set()
+
+    def _try_add(t) -> None:
+        if use_cap and counts.get(industry[t], 0) >= max_per_sector:
+            return
+        chosen.append(t)
+        chosen_set.add(t)
+        if use_cap:
+            counts[industry[t]] = counts.get(industry[t], 0) + 1
+
+    if keep is not None and exit_rank:
+        retained = sorted((t for t in set(keep) if rank.get(t, exit_rank + 1) <= exit_rank), key=rank.get)
+        for t in retained:
+            if len(chosen) >= top_n:
+                break
+            _try_add(t)
+    for t in tickers:
+        if len(chosen) >= top_n:
+            break
+        if t not in chosen_set:
+            _try_add(t)
+    return sorted(chosen, key=rank.get)
+
+
+def scheme_weights(selected: pd.DataFrame, scheme: str) -> pd.Series:
+    """Price-only weights over ``selected``: ``score`` (∝ score), ``equal`` or
+    ``inverse_vol`` (∝ 1/σ — a simple risk-parity tilt). Degenerate inputs fall
+    back to equal weight. Never reads market cap, so it is look-ahead-free."""
+    if selected is None or selected.empty:
+        return pd.Series(dtype="float64")
+    n = len(selected)
+    equal = pd.Series(1.0 / n, index=selected.index)
+    if scheme == "equal":
+        return equal
+    if scheme == "inverse_vol":
+        sig = selected["sigma"] if "sigma" in selected.columns else pd.Series(np.nan, index=selected.index)
+        inv = (1.0 / sig.where(sig > 0)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        total = float(inv.sum())
+        return inv / total if total > 0 else equal
+    s = selected["score"].clip(lower=0.0)
+    total = float(s.sum())
+    return s / total if total > 0 else equal
+
+
+def select_and_weight(df: pd.DataFrame, params: ScanParams, keep=None, exit_rank: int | None = None) -> pd.DataFrame:
+    """Take the top-N eligible stocks and assign weights.
+
+    Methodology (``weighting="mcap_score"``):
+        raw weight  = free-float mcap x Normalized Momentum Score
+        cap_i       = min(cap_absolute, cap_relative x free-float-mcap-only weight_i)
+    Other schemes use :func:`scheme_weights` (price-only, uncapped).
+    ``keep`` / ``exit_rank`` apply a rank buffer around existing holdings (see
+    :func:`select_top`) — used when rebalancing a live portfolio.
     """
     scored = df[df["score"].notna()].copy()
-    selected = scored.nlargest(params.top_n, "score").copy()
+    chosen = select_top(scored, params.top_n, params.max_per_sector, keep=keep, exit_rank=exit_rank)
+    selected = scored.loc[chosen].copy()
     if selected.empty:
         selected["weight"] = []
+        return selected
+
+    if params.weighting != "mcap_score":
+        w = scheme_weights(selected, params.weighting)
+        ff = selected["ff_mcap"].fillna(0.0) if "ff_mcap" in selected else pd.Series(0.0, index=selected.index)
+        selected["raw_weight"] = w
+        selected["ffmc_weight"] = ff / ff.sum() if ff.sum() > 0 else np.nan
+        selected["cap"] = np.nan
+        selected["weight"] = w
+        selected["selection_rank"] = range(1, len(selected) + 1)
+        selected.attrs["caps_infeasible"] = False
         return selected
 
     ff = selected["ff_mcap"].fillna(0.0)
@@ -377,9 +512,10 @@ def run_scan(universe: pd.DataFrame, price_data, params: ScanParams) -> ScanResu
         )
     if price_data.failed:
         notes.append(f"{len(price_data.failed)} ticker(s) had no price data and were skipped.")
-    if market["market_cap"].isna().any():
-        n = int(market["market_cap"].isna().sum())
-        notes.append(f"{n} ticker(s) missing market cap; turnover-ratio filter/weights approximate for those.")
+    mcap_missing = int(market["market_cap"].isna().sum()) if "market_cap" in market else len(close.columns)
+    if mcap_missing and (params.weighting == "mcap_score" or params.apply_turnover_ratio_filter):
+        what = "turnover-ratio filter/weights" if params.weighting == "mcap_score" else "turnover-ratio filter"
+        notes.append(f"{mcap_missing} ticker(s) missing market cap; {what} approximate for those.")
 
     return ScanResult(
         results=df,

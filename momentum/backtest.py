@@ -31,7 +31,7 @@ import pandas as pd
 from dateutil.relativedelta import relativedelta
 
 from . import config
-from .scanner import ScanParams, run_scan
+from .scanner import ScanParams, _last_valid, _row_pos, run_scan, scheme_weights, select_top
 
 
 # --------------------------------------------------------------------------- #
@@ -50,12 +50,23 @@ class BacktestParams:
     start: dt.date                 # requested first-rebalance date (may be pushed later)
     end: dt.date                   # final valuation date (clamped to last trading day <= end)
     rebalance_months: int = 6      # cadence: 1=monthly, 3=quarterly, 6=semiannual, 12=annual
-    weighting: str = "score"       # "score" | "equal" — look-ahead-free only; never mcap-cap
+    weighting: str = "score"       # "score" | "equal" | "inverse_vol" — look-ahead-free; never mcap-cap
     cost_bps: float = 0.0          # bps charged on traded notional Σ|Δw| each rebalance
     rf_annual: float = 0.0         # risk-free p.a. for Sharpe/Sortino (rf=0 default)
     trading_days: int = config.TRADING_DAYS_PER_YEAR
     min_history_months: int | None = None  # override; None -> derived from scan_params
     initial_capital: float = config.BACKTEST_INITIAL_CAPITAL  # ₹ notional for the trade ledger
+    # Named cadence (key of config.REBALANCE_FREQUENCIES, e.g. "Weekly"); when set
+    # it overrides ``rebalance_months`` and unlocks daily / weekly / fortnightly.
+    rebalance_freq: str | None = None
+    # Rank buffer: a held name is kept while it still ranks <= exit_rank (None = off).
+    exit_rank: int | None = None
+    # Market-regime filter: at each rebalance, if the regime index closes below its
+    # ``regime_ma_days`` SMA, invest only ``regime_exposure_off`` of the book.
+    regime_filter: bool = False
+    regime_ma_days: int = config.REGIME_MA_DAYS
+    regime_exposure_off: float = 0.0
+    cash_yield_annual: float = 0.0  # return on uninvested cash (e.g. a liquid fund)
 
 
 @dataclass
@@ -72,6 +83,7 @@ class BacktestResult:
     relative_metrics: dict[str, float]
     membership_changes: pd.DataFrame = field(default_factory=pd.DataFrame)  # per-rebalance entries/exits
     transactions: pd.DataFrame = field(default_factory=pd.DataFrame)        # per-rebalance trade ledger
+    contributions: pd.DataFrame = field(default_factory=pd.DataFrame)       # per-period, per-name P&L
     notes: list[str] = field(default_factory=list)
     params: BacktestParams | None = None
     benchmark_name: str = ""
@@ -96,21 +108,54 @@ def _required_history_days(sp: ScanParams) -> int:
     return int(round(months * 30.44)) + 45  # month≈30.44d + holiday buffer
 
 
+def freq_spec(params: BacktestParams) -> tuple[str, int]:
+    """(unit, step) cadence of a backtest: a named ``rebalance_freq`` wins, else months."""
+    if params.rebalance_freq:
+        if params.rebalance_freq not in config.REBALANCE_FREQUENCIES:
+            raise ValueError(f"Unknown rebalance frequency {params.rebalance_freq!r}; "
+                             f"expected one of {list(config.REBALANCE_FREQUENCIES)}")
+        return config.REBALANCE_FREQUENCIES[params.rebalance_freq]
+    return "months", max(1, int(params.rebalance_months))
+
+
+def rebalances_per_year(unit: str, step: int, trading_days: int = config.TRADING_DAYS_PER_YEAR) -> float:
+    per_unit = {"days": float(trading_days), "weeks": 52.0, "months": 12.0}[unit]
+    return per_unit / max(1, int(step))
+
+
 def generate_schedule(
-    cal: pd.DatetimeIndex, start: dt.date, end: dt.date, rebalance_months: int
+    cal: pd.DatetimeIndex, start: dt.date, end: dt.date, rebalance_months: int, unit: str = "months"
 ) -> pd.DataFrame:
-    """Rebalance schedule: calendar dates stepping by ``rebalance_months`` from
-    ``start`` to ``end``, each snapped to the last trading day on/before it.
+    """Rebalance schedule from ``start`` to ``end``.
+
+    ``unit="months"``/``"weeks"``: calendar dates stepping by ``rebalance_months``
+    months/weeks, each snapped to the last trading day on/before it.
+    ``unit="days"``: every ``rebalance_months``-th *trading* day (no snapping).
 
     Returns a DataFrame with columns scheduled_date, trading_date, used, reason.
     Dates that snap to a trading day already used (holiday collisions) or that
     have no trading day are flagged ``used=False`` with a reason.
     """
+    cols = ["scheduled_date", "trading_date", "used", "reason"]
+    step = max(1, int(rebalance_months))
+    end_ts = pd.Timestamp(end)
+    if unit == "days":
+        first = _last_trading_day(cal, start)
+        if first is None:
+            later = cal[cal >= pd.Timestamp(start)]
+            first = later[0] if len(later) else None
+        if first is None:
+            return pd.DataFrame(columns=cols)
+        days = cal[(cal >= first) & (cal <= end_ts)][::step]
+        return pd.DataFrame({"scheduled_date": days, "trading_date": days, "used": True, "reason": ""},
+                            columns=cols)
+    if unit not in ("months", "weeks"):
+        raise ValueError(f"Unknown schedule unit {unit!r}")
+    delta = relativedelta(months=step) if unit == "months" else relativedelta(weeks=step)
+
     rows: list[dict] = []
     seen: set[pd.Timestamp] = set()
     d = pd.Timestamp(start)
-    end_ts = pd.Timestamp(end)
-    step = max(1, int(rebalance_months))
     while d <= end_ts:
         td = _last_trading_day(cal, d)
         used, reason = False, ""
@@ -122,8 +167,8 @@ def generate_schedule(
             used = True
             seen.add(td)
         rows.append({"scheduled_date": d, "trading_date": td, "used": used, "reason": reason})
-        d = d + relativedelta(months=step)
-    return pd.DataFrame(rows, columns=["scheduled_date", "trading_date", "used", "reason"])
+        d = d + delta
+    return pd.DataFrame(rows, columns=cols)
 
 
 def _feasible_first(cal: pd.DatetimeIndex, sp: ScanParams, min_history_months: int | None) -> pd.Timestamp:
@@ -145,19 +190,11 @@ def _feasible_first(cal: pd.DatetimeIndex, sp: ScanParams, min_history_months: i
 def _target_weights(selected: pd.DataFrame, weighting: str) -> pd.Series:
     """Look-ahead-free target weights over ``selected`` (indexed by YFTicker).
 
-    Uses the price-only ``score`` (``score / Σscore``) or equal weight. Never
-    reads the scanner's mcap-based ``weight`` column. Empty selection -> empty.
+    Uses the price-only ``score`` (``score / Σscore``), equal weight, or
+    inverse volatility (``1/σ``). Never reads the scanner's mcap-based ``weight``
+    column. Empty selection -> empty.
     """
-    if selected is None or selected.empty:
-        return pd.Series(dtype="float64")
-    if weighting == "equal":
-        n = len(selected)
-        return pd.Series(1.0 / n, index=selected.index)
-    s = selected["score"].clip(lower=0.0)
-    total = float(s.sum())
-    if total > 0:
-        return s / total
-    return pd.Series(1.0 / len(selected), index=selected.index)  # degenerate -> equal
+    return scheme_weights(selected, weighting)
 
 
 def _asof_prices(close: pd.DataFrame, tickers, when) -> pd.Series:
@@ -165,22 +202,30 @@ def _asof_prices(close: pd.DataFrame, tickers, when) -> pd.Series:
     tk = list(tickers)
     if not tk:
         return pd.Series(dtype="float64")
-    sub = close.loc[close.index <= pd.Timestamp(when), tk]
-    if sub.empty:
+    pos = _row_pos(close.index, when)
+    if pos < 0:
         return pd.Series(np.nan, index=tk)
-    return sub.ffill().iloc[-1]
+    vals = close[tk].to_numpy(dtype="float64")[: pos + 1]
+    return pd.Series(_last_valid(vals, ~np.isnan(vals), pos), index=tk)
+
+
+def _cash_growth(n_days: int, daily: float) -> np.ndarray:
+    """Cumulative growth factors (1+r)^k for k = 1..n_days."""
+    return (1.0 + daily) ** np.arange(1, n_days + 1)
 
 
 def _hold_period_path(
-    close: pd.DataFrame, weights: pd.Series, t0: pd.Timestamp, t1: pd.Timestamp
+    close: pd.DataFrame, weights: pd.Series, t0: pd.Timestamp, t1: pd.Timestamp,
+    cash: float = 0.0, cash_daily: float = 0.0,
 ) -> tuple[pd.Series, pd.Series]:
     """Buy-and-hold value path over ``(t0, t1]`` with shares FIXED at ``t0``.
 
-    Shares are set from ``weights`` at the ``t0`` price (so Σ shares·p0 = 1); the
-    returned value series is therefore based at ~1.0 at t0 and its last value is
-    the exact buy-and-hold period multiple. Prices are ffilled within the period
-    so a name that stops trading freezes at its last mark. Also returns the
-    drifted end-of-period weights (for turnover measurement).
+    Shares are set from ``weights`` at the ``t0`` price (so Σ shares·p0 = Σw); an
+    optional ``cash`` sleeve (``Σw + cash = 1``) compounds at ``cash_daily`` per
+    trading day. The returned value series is based at ~1.0 at t0 and its last
+    value is the exact period multiple. Prices are ffilled within the period so
+    a name that stops trading freezes at its last mark. Also returns the drifted
+    end-of-period weights as fractions of the whole book (for turnover).
     """
     tk = list(weights.index)
     p0 = _asof_prices(close, tk, t0)
@@ -194,11 +239,55 @@ def _hold_period_path(
         window.iloc[0] = window.iloc[0].fillna(p0)
     window = window.ffill()
     val = window.reindex(days).mul(shares, axis=1).sum(axis=1)
+    cash_end = 0.0
+    if cash > 0 and len(days):
+        growth = cash * _cash_growth(len(days), cash_daily)
+        val = val + growth
+        cash_end = float(growth[-1])
     p1 = _asof_prices(close, tk, t1)
     w_end = shares * p1
-    total = float(w_end.sum())
+    total = float(w_end.sum()) + cash_end
     w_end = w_end / total if total > 0 else pd.Series(dtype="float64")
     return val, w_end
+
+
+# --------------------------------------------------------------------------- #
+# Market regime & synthetic benchmark
+# --------------------------------------------------------------------------- #
+def regime_states(
+    series: pd.Series | None, dates, ma_days: int = config.REGIME_MA_DAYS
+) -> dict[pd.Timestamp, bool | None]:
+    """Risk-on flag per date: index close on/before ``d`` >= its ``ma_days`` SMA.
+
+    Uses only observations on/before each date (no look-ahead). ``None`` where
+    there is not yet ``ma_days`` of history (the caller treats that as risk-on).
+    """
+    out: dict[pd.Timestamp, bool | None] = {pd.Timestamp(d): None for d in dates}
+    if series is None or len(series) == 0:
+        return out
+    s = series.dropna().sort_index()
+    sma = s.rolling(int(ma_days), min_periods=int(ma_days)).mean()
+    for d in out:
+        pos = _row_pos(s.index, d)
+        if pos >= 0 and not np.isnan(sma.iloc[pos]):
+            out[d] = bool(s.iloc[pos] >= sma.iloc[pos])
+    return out
+
+
+def universe_equal_weight(close: pd.DataFrame) -> pd.Series:
+    """Daily-rebalanced equal-weight index of every name in ``close`` (base 1.0).
+
+    Each day's return is the average across names that traded on both days. It
+    shares the strategy's universe — and therefore its survivorship bias — so
+    strategy-minus-this isolates what the momentum *selection* adds.
+    """
+    if close is None or close.empty:
+        return pd.Series(dtype="float64", name="close")
+    rets = close.sort_index().pct_change(fill_method=None)
+    daily = rets.mean(axis=1, skipna=True).fillna(0.0)
+    level = (1.0 + daily).cumprod()
+    level.name = "close"
+    return level
 
 
 def _turnover_and_cost(
@@ -497,12 +586,44 @@ def _empty_result(notes: list[str], params: BacktestParams, schedule: pd.DataFra
     )
 
 
+# Columns kept when a scan is memoised for reuse across backtests (a sweep).
+_RANKED_COLS = ["Symbol", "Company", "Industry", "Segment", "score", "sigma"]
+
+
+class _RankedScan:
+    """Lightweight stand-in for a ScanResult: just the scored, eligible names."""
+
+    def __init__(self, results: pd.DataFrame):
+        self.results = results
+
+
+def _compact_scan(scan) -> _RankedScan:
+    res = getattr(scan, "results", None)
+    if res is None or "score" not in res.columns:
+        return scan  # e.g. a test stub exposing only .selected
+    ranked = res[res["score"].notna()]
+    return _RankedScan(ranked[[c for c in _RANKED_COLS if c in ranked.columns]].copy())
+
+
+def _select_from_scan(scan, sp: ScanParams, prev: list | None, exit_rank: int | None) -> pd.DataFrame:
+    """Selection at one rebalance: top-N (+ sector cap, + rank buffer) from the
+    scan's full ranking. Falls back to ``scan.selected`` when only that exists."""
+    res = getattr(scan, "results", None)
+    if res is None or "score" not in getattr(res, "columns", []):
+        return scan.selected
+    ranked = res[res["score"].notna()]
+    chosen = select_top(ranked, sp.top_n, sp.max_per_sector, keep=prev, exit_rank=exit_rank)
+    return ranked.loc[chosen]
+
+
 def run_backtest(
     universe_df: pd.DataFrame,
     price_data,
     params: BacktestParams,
     benchmark_series: pd.Series | None = None,
     progress=None,
+    regime_series: pd.Series | None = None,
+    scan_cache: dict | None = None,
 ) -> BacktestResult:
     """Run a rebalancing backtest.
 
@@ -510,6 +631,9 @@ def run_backtest(
     is a :class:`momentum.data.PriceData` covering the full history (its
     ``close`` is adjusted). ``benchmark_series`` is an adjusted-close Series
     (e.g. from ``data.fetch_benchmark``); ``progress`` is ``callable(done, total)``.
+    ``regime_series`` drives the regime filter (defaults to the benchmark).
+    ``scan_cache`` memoises per-date scans across runs that share every
+    ranking-relevant parameter (see :func:`run_sweep`).
     """
     close = price_data.close
     notes = _base_notes(params)
@@ -518,13 +642,14 @@ def run_backtest(
 
     cal = close.index.sort_values()
     sp = params.scan_params
+    unit, step = freq_spec(params)
 
     # -- schedule ----------------------------------------------------------- #
     feas = _feasible_first(cal, sp, params.min_history_months)
     first = max(pd.Timestamp(params.start), feas)
     if first > pd.Timestamp(params.start):
         notes.append(f"First rebalance moved to {first.date()} (insufficient prior history before requested start).")
-    schedule = generate_schedule(cal, first.date(), params.end, params.rebalance_months)
+    schedule = generate_schedule(cal, first.date(), params.end, step, unit)
     rb = [t for t in schedule.loc[schedule["used"], "trading_date"].tolist()]
 
     end_td = _last_trading_day(cal, params.end)
@@ -539,12 +664,27 @@ def run_backtest(
             params, schedule,
         )
 
+    # -- regime ------------------------------------------------------------- #
+    regime: dict[pd.Timestamp, bool | None] = {}
+    if params.regime_filter:
+        src = regime_series if regime_series is not None else benchmark_series
+        regime = regime_states(src, rb, params.regime_ma_days)
+        if src is None or len(src) == 0:
+            notes.append("Regime filter requested but no regime index data — filter not applied.")
+
     # -- PASS A: point-in-time selection (uses only prices <= entry) --------- #
     weights_by_date: dict[pd.Timestamp, pd.Series] = {}
     meta_by_date: dict[pd.Timestamp, pd.DataFrame] = {}
+    prev_names: list | None = None
     for i, d in enumerate(rb):
-        sp_d = replace(sp, asof=d.date(), apply_turnover_ratio_filter=False)
-        sel = run_scan(universe_df, price_data, sp_d).selected
+        scan = scan_cache.get(d) if scan_cache is not None else None
+        if scan is None:
+            sp_d = replace(sp, asof=d.date(), apply_turnover_ratio_filter=False)
+            scan = run_scan(universe_df, price_data, sp_d)
+            if scan_cache is not None:
+                scan = _compact_scan(scan)
+                scan_cache[d] = scan
+        sel = _select_from_scan(scan, sp, prev_names, params.exit_rank)
         w = _target_weights(sel, params.weighting)
         if not w.empty:  # drop names untradable at entry, renormalise
             p0 = _asof_prices(close, w.index, d)
@@ -553,8 +693,12 @@ def run_backtest(
                 w = w.loc[good] / w.loc[good].sum()
             else:
                 w = pd.Series(dtype="float64")
+        if regime.get(d) is False and not w.empty:
+            off = float(min(max(params.regime_exposure_off, 0.0), 1.0))
+            w = w * off if off > 0 else pd.Series(dtype="float64")
         weights_by_date[d] = w
         meta_by_date[d] = sel
+        prev_names = list(w.index) if not w.empty else None
         if progress:
             progress(i + 1, len(rb))
 
@@ -567,16 +711,19 @@ def run_backtest(
     )
 
     # -- PASS B: chain daily buy-and-hold multiples -------------------------- #
+    cash_daily = (1.0 + params.cash_yield_annual) ** (1.0 / params.trading_days) - 1.0
     E = 1.0
     w_prev = pd.Series(dtype="float64")
     eq: dict[pd.Timestamp, float] = {boundary[0]: 1.0}
     prows: list[dict] = []
     holdings: dict[pd.Timestamp, pd.DataFrame] = {}
     tx_rows: list[dict] = []
+    contrib_rows: list[dict] = []
 
     for i in range(len(boundary) - 1):
         t0, t1 = boundary[i], boundary[i + 1]
         w = weights_by_date.get(t0, pd.Series(dtype="float64"))
+        exposure = float(w.sum()) if not w.empty else 0.0
 
         one_way, cost = _turnover_and_cost(w, w_prev, params.cost_bps)
         E0 = E
@@ -589,24 +736,43 @@ def run_backtest(
 
         days = cal[(cal > t0) & (cal <= t1)]
         if w.empty or len(days) == 0:
-            for d in days:
-                eq[d] = E
+            growth = _cash_growth(len(days), cash_daily) if len(days) else np.array([])
+            for d, g in zip(days, growth):
+                eq[d] = E * float(g)
+            if len(days):
+                E = E * float(growth[-1])
             w_prev = pd.Series(dtype="float64")
             sret = E / E0 - 1.0
             if w.empty:
-                notes.append(f"{t0.date()}: empty selection → held cash for the period.")
+                why = "regime risk-off" if regime.get(t0) is False else "empty selection"
+                notes.append(f"{t0.date()}: {why} → held cash for the period.")
         else:
-            path, w_prev = _hold_period_path(close, w, t0, t1)
+            E_start = E
+            path, w_prev = _hold_period_path(close, w, t0, t1, cash=max(0.0, 1.0 - exposure),
+                                             cash_daily=cash_daily)
             for d, m in path.items():
                 eq[d] = E * float(m)
             E = E * float(path.iloc[-1])
             sret = E / E0 - 1.0
+            p0 = _asof_prices(close, w.index, t0)
+            p1 = _asof_prices(close, w.index, t1)
+            r = p1 / p0 - 1.0
+            sym = meta_map["Symbol"] if meta_map is not None else None
+            for tk in w.index:
+                contrib = E_start * float(w[tk]) * float(r[tk])
+                contrib_rows.append({
+                    "period_start": t0, "period_end": t1, "YFTicker": tk,
+                    "Symbol": sym.get(tk, tk) if sym is not None else tk,
+                    "weight": float(w[tk]), "ret": float(r[tk]),
+                    "contribution": contrib, "contribution_inr": contrib * params.initial_capital,
+                })
 
         prows.append({
             "rb_date": t0, "period_start": t0, "period_end": t1,
             "strat_ret": sret, "bench_ret": np.nan,
             "turnover": one_way, "cost_drag": cost,
             "n_holdings": int(len(w)), "empty": bool(w.empty),
+            "exposure": exposure, "risk_on": regime.get(t0) if params.regime_filter else None,
         })
         if not w.empty:
             meta = meta_by_date[t0]
@@ -619,8 +785,22 @@ def run_backtest(
 
     period_returns = pd.DataFrame(prows).set_index("rb_date")
     transactions = pd.DataFrame(tx_rows)
+    contributions = pd.DataFrame(contrib_rows)
     # Membership churn over the periods actually simulated (the t0 boundaries).
     membership_changes = compute_membership_changes(holdings, list(boundary[:-1]))
+
+    if params.regime_filter and regime:
+        sim = period_returns["risk_on"]
+        n_off = int((sim == False).sum())  # noqa: E712 — tri-state (None = no data yet)
+        notes.append(
+            f"Regime filter ({params.regime_ma_days}-day SMA): risk-off at {n_off} of {len(sim)} "
+            f"rebalances (exposure {params.regime_exposure_off:.0%} when risk-off)."
+        )
+        if sim.isna().any():
+            notes.append(f"Regime index lacked {params.regime_ma_days} days of history at "
+                         f"{int(sim.isna().sum())} rebalance(s) — treated as risk-on.")
+    if params.exit_rank:
+        notes.append(f"Rank buffer: holdings kept while ranked ≤ {params.exit_rank}.")
 
     # -- benchmark alignment ------------------------------------------------- #
     bench_curve = _align_benchmark(benchmark_series, equity.index, boundary[0])
@@ -629,31 +809,33 @@ def run_backtest(
 
     bench_period = None
     if bench_curve is not None:
+        bvals = bench_curve.to_numpy()
+        bidx = bench_curve.index
         bench_period_vals = {}
-        for _, prow in period_returns.iterrows():
-            t0, t1 = prow["period_start"], prow["period_end"]
-            b0 = bench_curve.loc[bench_curve.index <= t0].dropna()
-            b1 = bench_curve.loc[bench_curve.index <= t1].dropna()
-            if len(b0) and len(b1):
-                bench_period_vals[prow.name] = float(b1.iloc[-1] / b0.iloc[-1] - 1.0)
-        bench_period = pd.Series(bench_period_vals)
+        for rbd, t0, t1 in zip(period_returns.index, period_returns["period_start"], period_returns["period_end"]):
+            i0, i1 = _row_pos(bidx, t0), _row_pos(bidx, t1)
+            if i0 >= 0 and i1 >= 0 and np.isfinite(bvals[i0]) and np.isfinite(bvals[i1]):
+                bench_period_vals[rbd] = float(bvals[i1] / bvals[i0] - 1.0)
+        bench_period = pd.Series(bench_period_vals, dtype="float64")
         period_returns["bench_ret"] = period_returns.index.map(bench_period).astype(float)
 
     # -- analytics ----------------------------------------------------------- #
     drawdown = (equity / equity.cummax() - 1.0)
     drawdown.name = "portfolio"
-    rebals_per_year = 12.0 / max(1, params.rebalance_months)
+    rpy = rebalances_per_year(unit, step, params.trading_days)
 
     metrics = compute_metrics(
         equity, period_returns["strat_ret"], period_returns["turnover"],
-        period_returns["cost_drag"], params.trading_days, params.rf_annual, rebals_per_year,
+        period_returns["cost_drag"], params.trading_days, params.rf_annual, rpy,
     )
+    if params.regime_filter:
+        metrics["time_in_market"] = float(period_returns["exposure"].mean())
     benchmark_metrics = {}
     if bench_curve is not None:
         benchmark_metrics = compute_metrics(
             bench_curve,
             bench_period if bench_period is not None else None,
-            None, None, params.trading_days, params.rf_annual, rebals_per_year,
+            None, None, params.trading_days, params.rf_annual, rpy,
         )
     relative_metrics = compute_relative_metrics(
         equity, bench_curve, period_returns["strat_ret"], bench_period, params.trading_days,
@@ -672,6 +854,58 @@ def run_backtest(
         relative_metrics=relative_metrics,
         membership_changes=membership_changes,
         transactions=transactions,
+        contributions=contributions,
         notes=notes,
         params=params,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Strategy comparison (parameter sweep)
+# --------------------------------------------------------------------------- #
+SWEEP_METRICS = ["cagr", "ann_vol", "sharpe", "sortino", "max_dd", "calmar", "annual_turnover",
+                 "total_return", "hit_rate"]
+
+
+def run_sweep(
+    universe_df: pd.DataFrame,
+    price_data,
+    base: BacktestParams,
+    top_ns: list[int],
+    freqs: list[str],
+    benchmark_series: pd.Series | None = None,
+    regime_series: pd.Series | None = None,
+    progress=None,
+) -> tuple[pd.DataFrame, dict[str, pd.Series]]:
+    """Backtest every (rebalance frequency × Top-N) combination of ``base``.
+
+    Every other knob is held fixed. The momentum *ranking* at a date does not
+    depend on Top-N or cadence, so scans are memoised once per trading date and
+    shared across all combinations — a 3×3 grid costs little more than its
+    densest single cadence. A rank buffer is scaled with Top-N (same ratio).
+    Returns (one metrics row per combination, label -> equity curve).
+    """
+    cache: dict = {}
+    combos = [(f, int(n)) for f in freqs for n in top_ns]
+    rows: list[dict] = []
+    curves: dict[str, pd.Series] = {}
+    base_n = max(1, int(base.scan_params.top_n))
+    for k, (f, n) in enumerate(combos):
+        exit_rank = None
+        if base.exit_rank:
+            exit_rank = max(n, int(round(n * base.exit_rank / base_n)))
+        p = replace(base, rebalance_freq=f, exit_rank=exit_rank,
+                    scan_params=replace(base.scan_params, top_n=n))
+        res = run_backtest(universe_df, price_data, p, benchmark_series=benchmark_series,
+                           regime_series=regime_series, scan_cache=cache)
+        label = f"{f} · Top {n}"
+        row = {"label": label, "frequency": f, "top_n": n}
+        row.update({m: res.metrics.get(m, np.nan) for m in SWEEP_METRICS})
+        row["alpha_annual"] = res.relative_metrics.get("alpha_annual", np.nan)
+        row["info_ratio"] = res.relative_metrics.get("info_ratio", np.nan)
+        rows.append(row)
+        if not res.equity_curve.empty:
+            curves[label] = res.equity_curve
+        if progress:
+            progress(k + 1, len(combos))
+    return pd.DataFrame(rows), curves

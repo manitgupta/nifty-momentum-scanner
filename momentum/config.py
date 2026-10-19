@@ -45,32 +45,191 @@ SIZE_SEGMENT_URLS: dict[str, str] = {
     "Small": f"{NSE_BASE}/ind_niftysmallcap250list.csv",
 }
 
-# Whole-index universes downloaded as one CSV each.
+# Whole-index universes downloaded as one CSV each: broad-market, sectoral,
+# thematic and strategy indices. Every key has a committed seed CSV fallback
+# (``seed_data/constituents_<key.lower()>.csv``).
 INDEX_UNIVERSE_URLS: dict[str, str] = {
     "Nifty500": f"{NSE_BASE}/ind_nifty500list.csv",
     "NiftyTotalMarket": f"{NSE_BASE}/ind_niftytotalmarket_list.csv",
+    # broad market
+    "Nifty50": f"{NSE_BASE}/ind_nifty50list.csv",
+    "NiftyNext50": f"{NSE_BASE}/ind_niftynext50list.csv",
+    "Nifty200": f"{NSE_BASE}/ind_nifty200list.csv",
+    "NiftyMidcap100": f"{NSE_BASE}/ind_niftymidcap100list.csv",
+    "NiftySmallcap100": f"{NSE_BASE}/ind_niftysmallcap100list.csv",
+    "NiftyMicrocap250": f"{NSE_BASE}/ind_niftymicrocap250_list.csv",
+    "NiftyLargeMidcap250": f"{NSE_BASE}/ind_niftylargemidcap250list.csv",
+    "NiftyMidSmallcap400": f"{NSE_BASE}/ind_niftymidsmallcap400list.csv",
+    # sectoral
+    "NiftyBank": f"{NSE_BASE}/ind_niftybanklist.csv",
+    "NiftyFinancialServices": f"{NSE_BASE}/ind_niftyfinancelist.csv",
+    "NiftyPrivateBank": f"{NSE_BASE}/ind_nifty_privatebanklist.csv",
+    "NiftyPSUBank": f"{NSE_BASE}/ind_niftypsubanklist.csv",
+    "NiftyIT": f"{NSE_BASE}/ind_niftyitlist.csv",
+    "NiftyPharma": f"{NSE_BASE}/ind_niftypharmalist.csv",
+    "NiftyHealthcare": f"{NSE_BASE}/ind_niftyhealthcarelist.csv",
+    "NiftyAuto": f"{NSE_BASE}/ind_niftyautolist.csv",
+    "NiftyFMCG": f"{NSE_BASE}/ind_niftyfmcglist.csv",
+    "NiftyMetal": f"{NSE_BASE}/ind_niftymetallist.csv",
+    "NiftyRealty": f"{NSE_BASE}/ind_niftyrealtylist.csv",
+    "NiftyEnergy": f"{NSE_BASE}/ind_niftyenergylist.csv",
+    "NiftyOilGas": f"{NSE_BASE}/ind_niftyoilgaslist.csv",
+    "NiftyMedia": f"{NSE_BASE}/ind_niftymedialist.csv",
+    "NiftyConsumerDurables": f"{NSE_BASE}/ind_niftyconsumerdurableslist.csv",
+    # thematic & strategy
+    "NiftyInfra": f"{NSE_BASE}/ind_niftyinfralist.csv",
+    "NiftyIndiaConsumption": f"{NSE_BASE}/ind_niftyconsumptionlist.csv",
+    "NiftyCPSE": f"{NSE_BASE}/ind_niftycpselist.csv",
+    "NiftyPSE": f"{NSE_BASE}/ind_niftypselist.csv",
+    "NiftyIndiaDefence": f"{NSE_BASE}/ind_niftyindiadefence_list.csv",
+    "NiftyCommodities": f"{NSE_BASE}/ind_niftycommoditieslist.csv",
+    "NiftyMNC": f"{NSE_BASE}/ind_niftymnclist.csv",
+    "NiftyServices": f"{NSE_BASE}/ind_niftyservicelist.csv",
+    "Nifty200Momentum30": f"{NSE_BASE}/ind_nifty200Momentum30_list.csv",
+    "Nifty500Momentum50": f"{NSE_BASE}/ind_nifty500Momentum50_list.csv",
 }
 
 # Combined lookup; size segments first so that when a stock appears in several
 # selected universes the size-bucket label wins during de-duplication.
 SEGMENT_URLS: dict[str, str] = {**SIZE_SEGMENT_URLS, **INDEX_UNIVERSE_URLS}
-SEGMENTS = list(SEGMENT_URLS.keys())
+
+# Non-NSE-index universes: a curated ETF list (committed CSV) and a free-form
+# list of NSE symbols typed by the user.
+ETF_SEGMENT = "ETF"
+CUSTOM_SEGMENT = "Custom"
+ETF_LIST_PATH = SEED_DIR / "etfs.csv"
+
+SEGMENTS = list(SEGMENT_URLS.keys()) + [ETF_SEGMENT]
 SIZE_SEGMENTS = list(SIZE_SEGMENT_URLS.keys())
 INDEX_UNIVERSES = list(INDEX_UNIVERSE_URLS.keys())
+
+# Human labels for the "Index" universe picker, grouped. Nifty 100 / Midcap 150 /
+# Smallcap 250 reuse the size-segment keys (same NSE lists).
+INDEX_GROUPS: dict[str, dict[str, str]] = {
+    "Broad market": {
+        "Nifty 50": "Nifty50",
+        "Nifty Next 50": "NiftyNext50",
+        "Nifty 100": "Largecap",
+        "Nifty 200": "Nifty200",
+        "Nifty 500": "Nifty500",
+        "Nifty Midcap 150": "Midcap",
+        "Nifty Midcap 100": "NiftyMidcap100",
+        "Nifty Smallcap 250": "Small",
+        "Nifty Smallcap 100": "NiftySmallcap100",
+        "Nifty Microcap 250": "NiftyMicrocap250",
+        "Nifty LargeMidcap 250": "NiftyLargeMidcap250",
+        "Nifty MidSmallcap 400": "NiftyMidSmallcap400",
+        "Nifty Total Market (~750)": "NiftyTotalMarket",
+    },
+    "Sectoral": {
+        "Nifty Bank": "NiftyBank",
+        "Nifty Financial Services": "NiftyFinancialServices",
+        "Nifty Private Bank": "NiftyPrivateBank",
+        "Nifty PSU Bank": "NiftyPSUBank",
+        "Nifty IT": "NiftyIT",
+        "Nifty Pharma": "NiftyPharma",
+        "Nifty Healthcare": "NiftyHealthcare",
+        "Nifty Auto": "NiftyAuto",
+        "Nifty FMCG": "NiftyFMCG",
+        "Nifty Metal": "NiftyMetal",
+        "Nifty Realty": "NiftyRealty",
+        "Nifty Energy": "NiftyEnergy",
+        "Nifty Oil & Gas": "NiftyOilGas",
+        "Nifty Media": "NiftyMedia",
+        "Nifty Consumer Durables": "NiftyConsumerDurables",
+    },
+    "Thematic & strategy": {
+        "Nifty Infrastructure": "NiftyInfra",
+        "Nifty India Consumption": "NiftyIndiaConsumption",
+        "Nifty CPSE": "NiftyCPSE",
+        "Nifty PSE": "NiftyPSE",
+        "Nifty India Defence": "NiftyIndiaDefence",
+        "Nifty Commodities": "NiftyCommodities",
+        "Nifty MNC": "NiftyMNC",
+        "Nifty Services Sector": "NiftyServices",
+        "Nifty200 Momentum 30": "Nifty200Momentum30",
+        "Nifty500 Momentum 50": "Nifty500Momentum50",
+    },
+}
+INDEX_CHOICES: dict[str, str] = {lab: key for grp in INDEX_GROUPS.values() for lab, key in grp.items()}
+SEGMENT_LABELS: dict[str, str] = {
+    **{key: lab for lab, key in INDEX_CHOICES.items()},
+    ETF_SEGMENT: "ETFs", CUSTOM_SEGMENT: "Custom list",
+}
 
 # Yahoo Finance ticker suffix for NSE-listed equities.
 YF_SUFFIX = ".NS"
 
 # --------------------------------------------------------------------------- #
-# Benchmark indices — Yahoo Finance index symbols, used to draw a comparison
-# equity curve against the momentum portfolio in backtests. (Nifty Total Market
-# has no working Yahoo symbol, so the Nifty 500 serves as its proxy benchmark.)
+# Benchmark indices for backtests. Each entry may carry:
+#   nse   — index name on niftyindices.com (full daily history since ~2005, and
+#           a Total Return Index (TRI) series that includes dividends);
+#   yahoo — a Yahoo Finance symbol (price-only) used as a fallback, or as the
+#           only source for ETF-based benchmarks.
+# The strategy is valued on dividend-ADJUSTED closes, so the TRI is the
+# apples-to-apples comparison; a price index flatters the strategy by the
+# dividend yield (~1-1.5% a year).
 # --------------------------------------------------------------------------- #
-BENCHMARKS: dict[str, str] = {
-    "Nifty 50": "^NSEI",
-    "Nifty 500": "^CRSLDX",
+NIFTYINDICES_URL = "https://www.niftyindices.com/BackPage"
+BENCHMARKS: dict[str, dict[str, str]] = {
+    "Nifty 50": {"nse": "NIFTY 50", "yahoo": "^NSEI"},
+    "Nifty Next 50": {"nse": "NIFTY NEXT 50", "yahoo": "^NSMIDCP"},
+    "Nifty 100": {"nse": "NIFTY 100", "yahoo": "^CNX100"},
+    "Nifty 200": {"nse": "NIFTY 200", "yahoo": "^CNX200"},
+    "Nifty 500": {"nse": "NIFTY 500", "yahoo": "^CRSLDX"},
+    "Nifty Midcap 150": {"nse": "NIFTY MIDCAP 150", "yahoo": "NIFTYMIDCAP150.NS"},
+    "Nifty Midcap 100": {"nse": "NIFTY MIDCAP 100"},
+    "Nifty Smallcap 250": {"nse": "NIFTY SMALLCAP 250", "yahoo": "NIFTYSMLCAP250.NS"},
+    "Nifty Smallcap 100": {"nse": "NIFTY SMALLCAP 100"},
+    "Nifty Microcap 250": {"nse": "NIFTY MICROCAP 250"},
+    "Nifty LargeMidcap 250": {"nse": "NIFTY LARGEMIDCAP 250"},
+    "Nifty MidSmallcap 400": {"nse": "NIFTY MIDSMALLCAP 400"},
+    "Nifty Total Market": {"nse": "NIFTY TOTAL MARKET"},
+    "Nifty Bank": {"nse": "NIFTY BANK", "yahoo": "^NSEBANK"},
+    "Nifty Financial Services": {"nse": "NIFTY FINANCIAL SERVICES"},
+    "Nifty Private Bank": {"nse": "NIFTY PRIVATE BANK"},
+    "Nifty PSU Bank": {"nse": "NIFTY PSU BANK"},
+    "Nifty IT": {"nse": "NIFTY IT", "yahoo": "^CNXIT"},
+    "Nifty Pharma": {"nse": "NIFTY PHARMA", "yahoo": "^CNXPHARMA"},
+    "Nifty Healthcare": {"nse": "NIFTY HEALTHCARE"},
+    "Nifty Auto": {"nse": "NIFTY AUTO"},
+    "Nifty FMCG": {"nse": "NIFTY FMCG"},
+    "Nifty Metal": {"nse": "NIFTY METAL"},
+    "Nifty Realty": {"nse": "NIFTY REALTY"},
+    "Nifty Energy": {"nse": "NIFTY ENERGY"},
+    "Nifty Infrastructure": {"nse": "NIFTY INFRASTRUCTURE"},
+    "Nifty200 Momentum 30": {"nse": "NIFTY200 MOMENTUM 30"},
+    "Nifty500 Momentum 50": {"nse": "NIFTY500 MOMENTUM 50"},
+    "Gold (GOLDBEES ETF)": {"yahoo": "GOLDBEES.NS"},
+    "Nasdaq 100 (MON100 ETF)": {"yahoo": "MON100.NS"},
 }
 DEFAULT_BENCHMARK = "Nifty 500"
+# Pseudo-benchmarks resolved in the app rather than fetched by name.
+AUTO_BENCHMARK = "Auto (match universe)"
+UNIVERSE_EW_BENCHMARK = "Universe equal-weight (same stocks)"
+
+# Which benchmark "Auto" resolves to for a single selected universe.
+UNIVERSE_BENCHMARK: dict[str, str] = {
+    "Largecap": "Nifty 100", "Midcap": "Nifty Midcap 150", "Small": "Nifty Smallcap 250",
+    "Nifty500": "Nifty 500", "NiftyTotalMarket": "Nifty Total Market",
+    "Nifty50": "Nifty 50", "NiftyNext50": "Nifty Next 50", "Nifty200": "Nifty 200",
+    "NiftyMidcap100": "Nifty Midcap 100", "NiftySmallcap100": "Nifty Smallcap 100",
+    "NiftyMicrocap250": "Nifty Microcap 250", "NiftyLargeMidcap250": "Nifty LargeMidcap 250",
+    "NiftyMidSmallcap400": "Nifty MidSmallcap 400",
+    "NiftyBank": "Nifty Bank", "NiftyFinancialServices": "Nifty Financial Services",
+    "NiftyPrivateBank": "Nifty Private Bank", "NiftyPSUBank": "Nifty PSU Bank",
+    "NiftyIT": "Nifty IT", "NiftyPharma": "Nifty Pharma", "NiftyHealthcare": "Nifty Healthcare",
+    "NiftyAuto": "Nifty Auto", "NiftyFMCG": "Nifty FMCG", "NiftyMetal": "Nifty Metal",
+    "NiftyRealty": "Nifty Realty", "NiftyEnergy": "Nifty Energy", "NiftyInfra": "Nifty Infrastructure",
+    "Nifty200Momentum30": "Nifty200 Momentum 30", "Nifty500Momentum50": "Nifty500 Momentum 50",
+    ETF_SEGMENT: "Nifty 50",
+}
+# Size-segment combinations map to the matching composite index.
+SEGMENT_COMBO_BENCHMARK: dict[frozenset, str] = {
+    frozenset({"Largecap", "Midcap"}): "Nifty LargeMidcap 250",
+    frozenset({"Midcap", "Small"}): "Nifty MidSmallcap 400",
+    frozenset({"Largecap", "Midcap", "Small"}): "Nifty 500",
+}
 
 # Browser-like headers; NSE archives reject requests without a User-Agent.
 HTTP_HEADERS = {
@@ -150,3 +309,35 @@ BACKTEST_INITIAL_CAPITAL = 100.0
 # Long-history downloads are cached far longer than the 6h live-scan cache: the
 # deep past does not change, so re-fetching multi-year frames is wasteful.
 HISTORY_CACHE_HOURS = 24 * 7
+
+# Rebalance cadences: label -> (unit, step). "days" steps through actual trading
+# days; "weeks"/"months" step through the calendar and snap each date back to
+# the last trading day on/before it.
+REBALANCE_FREQUENCIES: dict[str, tuple[str, int]] = {
+    "Daily": ("days", 1),
+    "Weekly": ("weeks", 1),
+    "Fortnightly": ("weeks", 2),
+    "Monthly": ("months", 1),
+    "Quarterly": ("months", 3),
+    "Semi-annual": ("months", 6),
+    "Annual": ("months", 12),
+}
+DEFAULT_REBALANCE = "Semi-annual"
+
+# Per-side trading-cost presets (bps of traded value) for Indian equity delivery.
+# Statutory ≈ STT 0.1% + stamp duty 0.015% (buy) + exchange/SEBI fees + 18% GST
+# on fees ≈ 11 bps per side on average; slippage/brokerage come on top.
+COST_PRESETS: dict[str, float | None] = {
+    "Frictionless (0 bps)": 0.0,
+    "Statutory only (~11 bps)": 11.0,
+    "Discount broker + slippage (~20 bps)": 20.0,
+    "Full-service broker (~50 bps)": 50.0,
+    "Custom": None,
+}
+
+# Market-regime (trend) filter defaults: be invested only while the regime index
+# closes above its N-day simple moving average at a rebalance.
+REGIME_MA_DAYS = 200
+
+# SIP simulator defaults (monthly instalment, ₹).
+SIP_DEFAULT_AMOUNT = 10_000.0

@@ -216,6 +216,120 @@ def test_integration_ranking():
     check("integration: sigma finite", np.isfinite(res.results.loc["STRONG.NS", "sigma"]))
 
 
+# --------------------------------------------------------------------------- #
+def _reference_momentum(close: pd.DataFrame, params) -> pd.DataFrame:
+    """The original per-ticker loop, kept verbatim as an oracle for the vectorised version."""
+    from dateutil.relativedelta import relativedelta
+    asof = params.asof
+    end = asof - relativedelta(months=params.skip_months)
+    date_6m = asof - relativedelta(months=params.lookback_short_months)
+    date_12m = asof - relativedelta(months=params.lookback_long_months)
+    vol_start = asof - relativedelta(months=params.vol_lookback_months)
+    rows = []
+    for ticker in close.columns:
+        series = close[ticker].dropna()
+        if series.empty:
+            continue
+        p0 = scanner._asof_price(series, end)
+        p6 = scanner._asof_price(series, date_6m)
+        p12 = scanner._asof_price(series, date_12m)
+        ret_6m = p0 / p6 - 1.0 if (p6 and not np.isnan(p6)) else np.nan
+        ret_12m = p0 / p12 - 1.0 if (p12 and not np.isnan(p12)) else np.nan
+        window = series[(series.index > pd.Timestamp(vol_start)) & (series.index <= pd.Timestamp(asof))]
+        log_ret = np.log(window / window.shift(1)).dropna()
+        sigma = float(log_ret.std(ddof=params.vol_ddof) * np.sqrt(params.trading_days)) if len(log_ret) >= 2 else np.nan
+        ok = sigma and not np.isnan(sigma) and sigma > 0
+        rows.append({"YFTicker": ticker, "ret_6m": ret_6m, "ret_12m": ret_12m, "sigma": sigma,
+                     "mr_6": ret_6m / sigma if ok else np.nan, "mr_12": ret_12m / sigma if ok else np.nan,
+                     "n_obs": int(series[series.index <= pd.Timestamp(asof)].shape[0]),
+                     "first_date": series.index.min(), "last_date": series.index.max()})
+    return pd.DataFrame(rows).set_index("YFTicker")
+
+
+def test_vectorised_momentum_matches_reference():
+    """The vectorised compute_momentum must reproduce the per-ticker loop exactly,
+    including NaN gaps, late listings, halted names and an all-NaN ticker."""
+    rng = np.random.default_rng(7)
+    idx = pd.bdate_range("2021-01-01", "2026-06-30")
+    n = 40
+    close = pd.DataFrame(100 * np.exp(np.cumsum(rng.normal(0.0004, 0.02, (len(idx), n)), axis=0)),
+                         index=idx, columns=[f"T{i:02d}.NS" for i in range(n)])
+    for j in range(0, n, 5):                        # late listings
+        close.iloc[: rng.integers(50, 1200), j] = np.nan
+    for j in range(1, n, 7):                        # random gaps / halts
+        close.iloc[rng.choice(len(idx), 60, replace=False), j] = np.nan
+    close.iloc[-40:, 3] = np.nan                    # stopped trading before as-of
+    close["DEAD.NS"] = np.nan                       # never traded
+    close["NEWBIE.NS"] = np.nan
+    close.loc[idx[-30]:, "NEWBIE.NS"] = 50.0        # listed after an early as-of
+    ok_all = True
+    for asof, skip, ddof in ((dt.date(2026, 6, 30), 0, 1), (dt.date(2025, 3, 15), 1, 0), (dt.date(2023, 8, 1), 2, 1)):
+        p = scanner.ScanParams(asof=asof, skip_months=skip, vol_ddof=ddof)
+        new = scanner.compute_momentum(close, p)
+        ref = _reference_momentum(close, p)
+        same_index = list(new.index) == list(ref.index)
+        num = ["ret_6m", "ret_12m", "sigma", "mr_6", "mr_12"]
+        diff = np.nanmax(np.abs(new.loc[ref.index, num].to_numpy(float) - ref[num].to_numpy(float)))
+        nan_same = bool((new.loc[ref.index, num].isna().to_numpy() == ref[num].isna().to_numpy()).all())
+        ints_same = (new.loc[ref.index, "n_obs"].tolist() == ref["n_obs"].tolist()
+                     and new.loc[ref.index, "first_date"].tolist() == ref["first_date"].tolist()
+                     and new.loc[ref.index, "last_date"].tolist() == ref["last_date"].tolist())
+        ok = same_index and diff < 1e-10 and nan_same and ints_same
+        ok_all &= ok
+        check(f"vectorised: matches reference loop (asof={asof}, skip={skip}, ddof={ddof})", ok,
+              f"index={same_index} maxdiff={diff:.2e} nan={nan_same} ints={ints_same}")
+    check("vectorised: all-NaN ticker skipped", "DEAD.NS" not in scanner.compute_momentum(
+        close, scanner.ScanParams(asof=dt.date(2026, 6, 30))).index)
+    empty = scanner.compute_momentum(pd.DataFrame(), scanner.ScanParams(asof=dt.date(2026, 6, 30)))
+    check("vectorised: empty frame -> empty result with columns", empty.empty and "sigma" in empty.columns)
+
+
+def test_select_top_sector_cap_and_buffer():
+    ranked = pd.DataFrame({
+        "score": [9, 8, 7, 6, 5, 4, 3],
+        "Industry": ["Bank", "Bank", "Bank", "IT", "IT", "Pharma", None],
+    }, index=list("ABCDEFG"))
+    check("select_top: plain top-3 by score", scanner.select_top(ranked, 3) == ["A", "B", "C"])
+    check("select_top: sector cap 1 skips over-represented industries",
+          scanner.select_top(ranked, 3, max_per_sector=1) == ["A", "D", "F"])
+    check("select_top: cap 2 + NaN industry is its own bucket",
+          scanner.select_top(ranked, 6, max_per_sector=2) == ["A", "B", "D", "E", "F", "G"])
+    # Buffer: currently hold F (rank 6) and G (rank 7); exit rank 6 keeps F only.
+    check("select_top: buffer keeps held names within exit rank",
+          scanner.select_top(ranked, 3, keep=["F", "G"], exit_rank=6) == ["A", "B", "F"])
+    check("select_top: buffer off -> pure top-N",
+          scanner.select_top(ranked, 3, keep=["F", "G"], exit_rank=None) == ["A", "B", "C"])
+    check("select_top: retained names still respect top_n",
+          scanner.select_top(ranked, 2, keep=list("CDEF"), exit_rank=7) == ["C", "D"])
+    check("select_top: empty / zero", scanner.select_top(ranked.iloc[:0], 3) == [] and scanner.select_top(ranked, 0) == [])
+
+
+def test_scheme_weights_and_weighting_modes():
+    sel = pd.DataFrame({"score": [3.0, 1.0], "sigma": [0.2, 0.4]}, index=["A", "B"])
+    check("scheme: score ∝ score", math.isclose(scanner.scheme_weights(sel, "score")["A"], 0.75))
+    check("scheme: equal", math.isclose(scanner.scheme_weights(sel, "equal")["B"], 0.5))
+    iv = scanner.scheme_weights(sel, "inverse_vol")
+    check("scheme: inverse-vol ∝ 1/σ (2:1)", math.isclose(iv["A"], 2 / 3) and math.isclose(iv.sum(), 1.0))
+    bad = pd.DataFrame({"score": [1.0, 1.0], "sigma": [np.nan, 0.0]}, index=["A", "B"])
+    check("scheme: inverse-vol with no usable σ -> equal", math.isclose(scanner.scheme_weights(bad, "inverse_vol")["A"], 0.5))
+
+    df = pd.DataFrame({
+        "score": [3.0, 2.0, 1.0, np.nan], "sigma": [0.2, 0.3, 0.4, 0.1], "ff_mcap": [np.nan] * 4,
+        "Industry": ["X", "X", "Y", "Y"],
+    }, index=["A", "B", "C", "D"])
+    for scheme in ("score", "equal", "inverse_vol"):
+        p = scanner.ScanParams(asof=dt.date(2026, 1, 1), top_n=3, weighting=scheme)
+        out = scanner.select_and_weight(df, p)
+        check(f"select_and_weight[{scheme}]: weights sum to 1 with no market caps",
+              math.isclose(out["weight"].sum(), 1.0) and list(out.index) == ["A", "B", "C"])
+    p = scanner.ScanParams(asof=dt.date(2026, 1, 1), top_n=3, weighting="equal", max_per_sector=1)
+    out = scanner.select_and_weight(df, p)
+    check("select_and_weight: sector cap applies in the scanner", list(out.index) == ["A", "C"])
+    out = scanner.select_and_weight(df, scanner.ScanParams(asof=dt.date(2026, 1, 1), top_n=1, weighting="equal"),
+                                    keep=["C"], exit_rank=3)
+    check("select_and_weight: live rank buffer keeps a held name", list(out.index) == ["C"])
+
+
 if __name__ == "__main__":
     test_asof_price()
     test_asof_closes()
@@ -224,6 +338,9 @@ if __name__ == "__main__":
     test_close_price_column()
     test_iterative_cap()
     test_integration_ranking()
+    test_vectorised_momentum_matches_reference()
+    test_select_top_sector_cap_and_buffer()
+    test_scheme_weights_and_weighting_modes()
     print("-" * 50)
     if _failures:
         print(f"{_failures} check(s) FAILED")
