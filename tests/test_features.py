@@ -234,7 +234,16 @@ def test_universe_helpers():
           <= set(config.BENCHMARKS))
     with patch("momentum.universe.requests.get", side_effect=RuntimeError("offline")):
         seg = universe.fetch_segment("NiftyFinancialServices", force_refresh=True)
+        micro = universe.fetch_segment("Micro", force_refresh=True)
     check("universe: NSE offline → seed fallback for a new index", len(seg) >= 15)
+    check("universe: Micro size segment loads (≈250 names)", len(micro) >= 240 and micro["Segment"].eq("Micro").all())
+    check("registry: Micro is a size segment benchmarked to Microcap 250",
+          "Micro" in config.SIZE_SEGMENTS and config.UNIVERSE_BENCHMARK["Micro"] == "Nifty Microcap 250")
+    try:
+        universe.build_universe(["Largecap", "NotAThing"])
+        check("universe: unknown segment → clear error", False)
+    except ValueError as exc:
+        check("universe: unknown segment → clear error", "NotAThing" in str(exc))
 
 
 # --------------------------------------------------------------------------- #

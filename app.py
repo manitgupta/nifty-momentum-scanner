@@ -63,27 +63,33 @@ st.sidebar.title("⚙️ Configuration")
 
 st.sidebar.subheader("Universe")
 UNI_MODES = ["Size segments", "Index", "ETFs", "Custom list"]
+# Stacked vertically: four options never fit one row of a (resizable) sidebar.
+UNI_MODE_LABELS = {"Size segments": "Size segments", "Index": "NSE index", "ETFs": "ETF basket",
+                   "Custom list": "Custom list"}
 uni_mode = st.sidebar.radio(
     "Universe source",
     UNI_MODES,
-    horizontal=True,
+    format_func=UNI_MODE_LABELS.get,
     key="uni_mode",
-    help="Size segments: compose from Nifty 100 / Midcap 150 / Smallcap 250 (their union ≈ "
-    "Nifty 500). Index: any NSE broad, sectoral or thematic index (combine several). ETFs: a "
-    "curated list of liquid NSE ETFs — momentum rotation across asset classes. Custom list: "
-    "type your own NSE symbols (stocks and/or ETFs).",
+    help="Size segments: compose from Nifty 100 / Midcap 150 / Smallcap 250 / Microcap 250 (the "
+    "first three ≈ Nifty 500; all four ≈ Nifty Total Market). NSE index: any broad, sectoral or "
+    "thematic index (combine several). ETF basket: a curated list of liquid NSE ETFs — momentum "
+    "rotation across asset classes. Custom list: type your own NSE symbols (stocks and/or ETFs).",
 )
 DEFAULT_CUSTOM = "RELIANCE, HDFCBANK, ICICIBANK, INFY, TCS, BHARTIARTL, LT, ITC, SBIN, NIFTYBEES, GOLDBEES"
 custom_symbols: list[str] = []
 etf_symbols: list[str] = []
 etf_extra: list[str] = []
 if uni_mode == "Size segments":
-    st.sidebar.caption("Segments map to NSE size buckets (their union ≈ Nifty 500).")
+    st.sidebar.caption("Segments map to NSE size buckets: Large + Mid + Small ≈ Nifty 500; "
+                       "add Micro for ≈ Nifty Total Market.")
     seg_large = st.sidebar.checkbox("Largecap · Nifty 100", value=True, key="seg_large")
     seg_mid = st.sidebar.checkbox("Midcap · Nifty Midcap 150", value=False, key="seg_mid")
     seg_small = st.sidebar.checkbox("Small · Nifty Smallcap 250", value=False, key="seg_small")
+    seg_micro = st.sidebar.checkbox("Micro · Nifty Microcap 250", value=False, key="seg_micro")
     selected_segments = [
-        s for s, on in [("Largecap", seg_large), ("Midcap", seg_mid), ("Small", seg_small)] if on
+        s for s, on in [("Largecap", seg_large), ("Midcap", seg_mid), ("Small", seg_small),
+                        ("Micro", seg_micro)] if on
     ]
 elif uni_mode == "Index":
     idx_labels = st.sidebar.multiselect(
@@ -297,7 +303,11 @@ def auto_benchmark() -> str:
         return config.DEFAULT_BENCHMARK
     if len(selected_segments) == 1:
         return config.UNIVERSE_BENCHMARK.get(selected_segments[0], config.DEFAULT_BENCHMARK)
-    return config.SEGMENT_COMBO_BENCHMARK.get(frozenset(selected_segments), config.DEFAULT_BENCHMARK)
+    combo = frozenset(selected_segments)
+    if combo in config.SEGMENT_COMBO_BENCHMARK:
+        return config.SEGMENT_COMBO_BENCHMARK[combo]
+    # Mixes that include microcaps are best matched by the broadest index.
+    return "Nifty Total Market" if "Micro" in combo else config.DEFAULT_BENCHMARK
 
 
 def fetch_named_benchmark(label: str, start: dt.date, end: dt.date, tri: bool) -> pd.Series:

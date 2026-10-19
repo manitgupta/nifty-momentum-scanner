@@ -22,7 +22,7 @@ inverse-volatility).
 
    | Universe source | What you get |
    |-----------------|--------------|
-   | **Size segments** | Largecap (Nifty 100) / Midcap (Midcap 150) / Small (Smallcap 250) — union ≈ Nifty 500 |
+   | **Size segments** | Largecap (Nifty 100) / Midcap (Midcap 150) / Small (Smallcap 250) / Micro (Microcap 250) — Large + Mid + Small ≈ Nifty 500; all four ≈ Nifty Total Market |
    | **Index** (multi-select) | *Broad:* Nifty 50, Next 50, 100, 200, 500, Midcap 150/100, Smallcap 250/100, **Microcap 250**, LargeMidcap 250, MidSmallcap 400, **Total Market (~750)**. *Sectoral:* **Bank**, **Financial Services**, Private Bank, PSU Bank, IT, Pharma, Healthcare, Auto, FMCG, Metal, Realty, Energy, Oil & Gas, Media, Consumer Durables. *Thematic/strategy:* Infrastructure, India Consumption, CPSE, PSE, India Defence, Commodities, MNC, Services, Nifty200 Momentum 30, Nifty500 Momentum 50. Several indices combine (de-duplicated). |
    | **ETFs** | A curated basket of 43 liquid NSE ETFs — one per underlying: broad equity, factor (momentum, alpha, low-vol, quality, value), sector, international (Nasdaq 100, FANG+, S&P 500 Top 50, Hang Seng), gold, silver, gilt and liquid. Pick any subset and add more symbols — a **custom ETF portfolio** for momentum rotation. |
    | **Custom list** | Any NSE symbols you type (stocks and/or ETFs). Names/industries are filled from the bundled lists. |

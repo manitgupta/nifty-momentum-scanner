@@ -30,7 +30,8 @@ MARKETCAP_CACHE_HOURS = 24
 #
 # Two flavours are offered:
 #   * Size segments — Largecap = Nifty 100, Midcap = Nifty Midcap 150,
-#     Small = Nifty Smallcap 250. Their union is (approximately) the Nifty 500.
+#     Small = Nifty Smallcap 250, Micro = Nifty Microcap 250. The first three
+#     union to ≈ the Nifty 500; all four to ≈ the Nifty Total Market.
 #   * Whole-index universes — the Nifty 500 and the Nifty Total Market (~750
 #     names, i.e. Nifty 500 + Microcap 250) downloaded directly as a single list.
 #
@@ -38,11 +39,12 @@ MARKETCAP_CACHE_HOURS = 24
 # --------------------------------------------------------------------------- #
 NSE_BASE = "https://nsearchives.nseindia.com/content/indices"
 
-# Size buckets whose union approximates the Nifty 500.
+# Size buckets: Large+Mid+Small ≈ Nifty 500; adding Micro ≈ Nifty Total Market.
 SIZE_SEGMENT_URLS: dict[str, str] = {
     "Largecap": f"{NSE_BASE}/ind_nifty100list.csv",
     "Midcap": f"{NSE_BASE}/ind_niftymidcap150list.csv",
     "Small": f"{NSE_BASE}/ind_niftysmallcap250list.csv",
+    "Micro": f"{NSE_BASE}/ind_niftymicrocap250_list.csv",
 }
 
 # Whole-index universes downloaded as one CSV each: broad-market, sectoral,
@@ -154,6 +156,7 @@ INDEX_GROUPS: dict[str, dict[str, str]] = {
 INDEX_CHOICES: dict[str, str] = {lab: key for grp in INDEX_GROUPS.values() for lab, key in grp.items()}
 SEGMENT_LABELS: dict[str, str] = {
     **{key: lab for lab, key in INDEX_CHOICES.items()},
+    "Micro": "Nifty Microcap 250",
     ETF_SEGMENT: "ETFs", CUSTOM_SEGMENT: "Custom list",
 }
 
@@ -211,6 +214,7 @@ UNIVERSE_EW_BENCHMARK = "Universe equal-weight (same stocks)"
 # Which benchmark "Auto" resolves to for a single selected universe.
 UNIVERSE_BENCHMARK: dict[str, str] = {
     "Largecap": "Nifty 100", "Midcap": "Nifty Midcap 150", "Small": "Nifty Smallcap 250",
+    "Micro": "Nifty Microcap 250",
     "Nifty500": "Nifty 500", "NiftyTotalMarket": "Nifty Total Market",
     "Nifty50": "Nifty 50", "NiftyNext50": "Nifty Next 50", "Nifty200": "Nifty 200",
     "NiftyMidcap100": "Nifty Midcap 100", "NiftySmallcap100": "Nifty Smallcap 100",
@@ -229,6 +233,7 @@ SEGMENT_COMBO_BENCHMARK: dict[frozenset, str] = {
     frozenset({"Largecap", "Midcap"}): "Nifty LargeMidcap 250",
     frozenset({"Midcap", "Small"}): "Nifty MidSmallcap 400",
     frozenset({"Largecap", "Midcap", "Small"}): "Nifty 500",
+    frozenset({"Largecap", "Midcap", "Small", "Micro"}): "Nifty Total Market",
 }
 
 # Browser-like headers; NSE archives reject requests without a User-Agent.

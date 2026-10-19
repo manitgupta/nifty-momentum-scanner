@@ -106,6 +106,9 @@ def build_universe(segments: list[str], force_refresh: bool = False) -> pd.DataF
     """
     if not segments:
         raise ValueError("Select at least one universe segment or index.")
+    unknown = [s for s in segments if s not in config.SEGMENTS]
+    if unknown:
+        raise ValueError(f"Unknown universe segment(s) {unknown}; expected some of {config.SEGMENTS}")
 
     ordered = [s for s in config.SEGMENTS if s in segments]
     frames = [fetch_segment(s, force_refresh=force_refresh) for s in ordered]

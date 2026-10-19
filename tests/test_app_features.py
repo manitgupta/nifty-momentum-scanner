@@ -160,6 +160,32 @@ def test_multi_index_universe():
               scan and "Nifty Bank" in scan["label"] and "Nifty Microcap 250" in scan["label"])
 
 
+def test_micro_size_segment():
+    p1, p2, p3 = _patched()
+    with p1, p2, p3:
+        BENCH_CALLS.clear()
+        at = _app()
+        check("micro: universe radio is vertical-friendly (4 options)", len(at.radio(key="uni_mode").options) == 4)
+        at.checkbox(key="seg_large").set_value(False)
+        at.checkbox(key="seg_micro").set_value(True).run()
+        at.button(key="run_scan").click().run()
+        check("micro: no exception", not at.exception, str(at.exception))
+        scan = ss(at, "scan")
+        check("micro: segment key 'Micro'", scan and scan["segments"] == ["Micro"], str(scan and scan["segments"]))
+        check("micro: labelled Nifty Microcap 250", scan and scan["label"] == "Nifty Microcap 250")
+        check("micro: regime/auto benchmark = Nifty Microcap 250",
+              any(c.get("nse_name") == "NIFTY MICROCAP 250" for c in BENCH_CALLS), str(BENCH_CALLS[-1:]))
+        for k in ("seg_large", "seg_mid", "seg_small"):
+            at.checkbox(key=k).set_value(True)
+        at.run()
+        BENCH_CALLS.clear()
+        at.date_input(key="bt_start").set_value(TODAY - dt.timedelta(days=3 * 365))
+        at.button(key="run_bt").click().run()
+        bt = ss(at, "bt")
+        check("micro: all four segments → Auto benchmark Nifty Total Market",
+              bt and bt["bench_name"] == "Nifty Total Market", str(bt and bt["bench_name"]))
+
+
 def test_etf_universe_scan_and_builder():
     p1, p2, p3 = _patched()
     with p1, p2, p3:
@@ -310,6 +336,7 @@ def test_compare_tab():
 
 if __name__ == "__main__":
     test_multi_index_universe()
+    test_micro_size_segment()
     test_etf_universe_scan_and_builder()
     test_custom_universe_and_sector_cap()
     test_new_frequencies()
